@@ -36,8 +36,8 @@ let package = Package(
         ),
         .binaryTarget(
             name: "SignalFfi",
-            url: "https://github.com/lucaslimapoa/libsignal/releases/download/v0.40.1-spm/SignalFfi.xcframework.zip",
-            checksum: "2012ff69242231176937d79674b3ce10cf0ce97292a58ac9bde81c06703c7d23"
+            url: "https://github.com/lucaslimapoa/libsignal/releases/download/v0.40.2/SignalFfi.xcframework.zip",
+            checksum: "2a67d0599a5607138b589e23626e7252dc01ad9027ade8a47593ecc66d350599"
         ),
     ]
 )
