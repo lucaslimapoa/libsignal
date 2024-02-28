@@ -53,7 +53,8 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Zipping artifacts"
-zip -r ../target/artifacts/SignalFfi.xcframework.zip ../target/artifacts/SignalFfi.xcframework
+
+ditto -c -k --sequesterRsrc --keepParent ../target/artifacts/SignalFfi.xcframework ../target/artifacts/SignalFfi.xcframework.zip
 
 echo "Creating checksum file from generated xcframework"
 shasum -a 256 ../target/artifacts/SignalFfi.xcframework.zip > ../target/artifacts/SignalFfi.xcframework.zip.sha256
