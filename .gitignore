@@ -25,3 +25,5 @@ java/shared/resources/*.so
 java/shared/resources/*.dll
 
 .DS_Store
+
+.swiftpm/xcode/
