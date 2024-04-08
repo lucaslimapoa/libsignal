@@ -9,6 +9,7 @@ use displaydoc::Display;
 
 use crate::client_connection::ClientConnection;
 use crate::svr2::RaftConfig;
+use crate::tpm2snp::Tpm2Error;
 use crate::{client_connection, dcap, nitro, proto, snow_resolver};
 use prost::Message;
 
@@ -90,6 +91,20 @@ impl From<nitro::NitroError> for Error {
     }
 }
 
+impl From<Tpm2Error> for AttestationError {
+    fn from(err: Tpm2Error) -> Self {
+        AttestationError {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<Tpm2Error> for Error {
+    fn from(err: Tpm2Error) -> Self {
+        Self::AttestationError(err.into())
+    }
+}
+
 /// A noise handshaker that can be used to build a [client_connection::ClientConnection]
 ///
 /// Callers provide an attestation that must contain the remote enclave's public key. If the
@@ -102,7 +117,7 @@ impl From<nitro::NitroError> for Error {
 /// ```pseudocode
 ///   let websocket = ... open websocket ...
 ///   let attestation_msg = websocket.recv();
-///   let (evidence, endoresments) = parse(attestation_msg);
+///   let (evidence, endorsements) = parse(attestation_msg);
 ///   let mut handshake = Handshake::new(
 ///     mrenclave, evidence, endorsements, acceptable_sw_advisories, current_time)?;
 ///   websocket.send(handshaker.initial_request());
@@ -181,7 +196,7 @@ impl UnvalidatedHandshake {
 
 pub struct Claims {
     pub(crate) public_key: Vec<u8>,
-    pub(crate) raft_group_config: Option<proto::svr2::RaftGroupConfig>,
+    pub(crate) raft_group_config: Option<proto::svr::RaftGroupConfig>,
     #[allow(dead_code)]
     pub(crate) custom: HashMap<String, Vec<u8>>,
 }
@@ -196,7 +211,7 @@ impl Claims {
 
         let raft_group_config = claims
             .remove("config")
-            .map(|bytes| proto::svr2::RaftGroupConfig::decode(bytes.as_slice()))
+            .map(|bytes| proto::svr::RaftGroupConfig::decode(bytes.as_slice()))
             .transpose()?;
 
         Ok(Self {
@@ -206,7 +221,7 @@ impl Claims {
         })
     }
 
-    pub fn from_attestation_data(data: proto::svr2::AttestationData) -> Result<Self> {
+    pub fn from_attestation_data(data: proto::svr::AttestationData) -> Result<Self> {
         let raft_group_config = data
             .group_config
             .ok_or_else(|| Error::AttestationDataError {

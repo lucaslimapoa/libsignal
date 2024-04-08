@@ -20,7 +20,7 @@ use crate::infra::ConnectionParams;
 
 pub(crate) const MAX_COOLDOWN_INTERVAL: Duration = Duration::from_secs(64);
 
-const COOLDOWN_INTERVALS: [Duration; 8] = [
+pub(crate) const COOLDOWN_INTERVALS: [Duration; 8] = [
     Duration::from_secs(0),
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -275,10 +275,10 @@ mod test {
     use std::future;
 
     use assert_matches::assert_matches;
+    use nonzero_ext::nonzero;
     use tokio::time;
 
     use crate::infra::certs::RootCertificates;
-    use crate::infra::dns::DnsResolver;
     use crate::infra::test::shared::{
         TestError, FEW_ATTEMPTS, LONG_CONNECTION_TIME, MANY_ATTEMPTS, TIMEOUT_DURATION,
         TIME_ADVANCE_VALUE,
@@ -495,12 +495,12 @@ mod test {
 
     fn example_connection_params(host: &str) -> ConnectionParams {
         ConnectionParams::new(
+            "test",
             host,
             host,
-            443,
+            nonzero!(443u16),
             HttpRequestDecoratorSeq::default(),
             RootCertificates::Signal,
-            DnsResolver::default().into(),
         )
     }
 }

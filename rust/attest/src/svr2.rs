@@ -7,7 +7,7 @@ use crate::constants::{ACCEPTABLE_SW_ADVISORIES, DEFAULT_SW_ADVISORIES, EXPECTED
 use prost::Message;
 
 use crate::enclave::{Error, Handshake, Result};
-use crate::proto::svr2;
+use crate::proto::svr;
 
 /// A RaftConfig that can be checked against the attested remote config
 #[derive(Debug)]
@@ -18,8 +18,8 @@ pub struct RaftConfig {
     pub group_id: u64,
 }
 
-impl PartialEq<svr2::RaftGroupConfig> for RaftConfig {
-    fn eq(&self, pb: &svr2::RaftGroupConfig) -> bool {
+impl PartialEq<svr::RaftGroupConfig> for RaftConfig {
+    fn eq(&self, pb: &svr::RaftGroupConfig) -> bool {
         pb.min_voting_replicas == self.min_voting_replicas
             && pb.max_voting_replicas == self.max_voting_replicas
             && pb.super_majority == self.super_majority
@@ -78,7 +78,7 @@ fn new_handshake_with_constants(
     expected_raft_config: &RaftConfig,
 ) -> Result<Handshake> {
     // Deserialize attestation handshake start.
-    let handshake_start = svr2::ClientHandshakeStart::decode(attestation_msg)?;
+    let handshake_start = svr::ClientHandshakeStart::decode(attestation_msg)?;
     let handshake = Handshake::for_sgx(
         mrenclave,
         &handshake_start.evidence,
@@ -102,18 +102,18 @@ mod tests {
     #[test]
     fn attest_svr2() {
         const HANDSHAKE_BYTES: &[u8] = include_bytes!("../tests/data/svr2handshakestart.data");
-        let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1683836600);
+        let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1709245753);
         let mrenclave_bytes =
-            hex!("a8a261420a6bb9b61aa25bf8a79e8bd20d7652531feb3381cbffd446d270be95");
+            hex!("acb1973aa0bbbd14b3b4e06f145497d948fd4a98efc500fcce363b3b743ec482");
         new_handshake(&mrenclave_bytes, HANDSHAKE_BYTES, current_time).unwrap();
     }
 
     #[test]
     fn attest_svr2_bad_config() {
         const HANDSHAKE_BYTES: &[u8] = include_bytes!("../tests/data/svr2handshakestart.data");
-        let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1683836600);
+        let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1709245753);
         let mrenclave_bytes =
-            hex!("a8a261420a6bb9b61aa25bf8a79e8bd20d7652531feb3381cbffd446d270be95");
+            hex!("acb1973aa0bbbd14b3b4e06f145497d948fd4a98efc500fcce363b3b743ec482");
 
         assert!(new_handshake_with_constants(
             &mrenclave_bytes,
@@ -138,7 +138,7 @@ mod tests {
         expected: &RaftConfig,
     ) -> bool {
         expected
-            == &svr2::RaftGroupConfig {
+            == &svr::RaftGroupConfig {
                 min_voting_replicas,
                 max_voting_replicas,
                 super_majority,

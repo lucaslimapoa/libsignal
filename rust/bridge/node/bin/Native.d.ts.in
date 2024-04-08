@@ -21,6 +21,26 @@ interface LookupResponseEntry {
   readonly pni: string | undefined;
 }
 
+interface ChatResponse {
+  status: number;
+  message: string | undefined;
+  headers: ReadonlyArray<[string, string]>;
+  body: Buffer | undefined;
+}
+
+interface ChatServiceDebugInfo {
+  connectionReused: boolean;
+  reconnectCount: number;
+  ipType: number;
+  durationMillis: number;
+  connectionInfo: string;
+}
+
+interface ResponseAndDebugInfo {
+  response: ChatResponse;
+  debugInfo: ChatServiceDebugInfo;
+}
+
 interface SealedSenderMultiRecipientMessageRecipient {
   deviceIds: number[];
   registrationIds: number[];
@@ -95,9 +115,9 @@ export abstract class InputStream {
 
 export abstract class SyncInputStream extends Buffer {}
 
-interface Wrapper<T> {
-  readonly _nativeHandle: T;
-}
+type Wrapper<T> = Readonly<{
+  _nativeHandle: T;
+}>;
 
 interface MessageBackupValidationOutcome {
   errorMessage: string | null;

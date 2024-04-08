@@ -2,34 +2,37 @@
 // Copyright 2020-2021 Signal Messenger, LLC.
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+use http::uri::InvalidUri;
 use std::fmt;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+use std::time::Duration;
 
 use jni::objects::{GlobalRef, JObject, JString, JThrowable};
 use jni::{JNIEnv, JavaVM};
-use libsignal_net::infra::errors::NetError;
 
 use attest::hsm_enclave::Error as HsmEnclaveError;
 use device_transfer::Error as DeviceTransferError;
-use libsignal_net::cdsi::CdsiError;
+use libsignal_net::chat::ChatServiceError;
+use libsignal_net::infra::ws::{WebSocketConnectError, WebSocketServiceError};
 use libsignal_protocol::*;
 use signal_crypto::Error as SignalCryptoError;
 use signal_pin::Error as PinError;
 use usernames::{UsernameError, UsernameLinkError};
 use zkgroup::{ZkGroupDeserializationFailure, ZkGroupVerificationFailure};
 
+use crate::net::cdsi::CdsiError;
 use crate::support::describe_panic;
 
 use super::*;
 
 /// The top-level error type for when something goes wrong.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SignalJniError {
     Protocol(SignalProtocolError),
     DeviceTransfer(DeviceTransferError),
     SignalCrypto(SignalCryptoError),
     HsmEnclave(HsmEnclaveError),
-    Sgx(SgxError),
+    Enclave(EnclaveError),
     Pin(PinError),
     ZkGroupDeserializationFailure(ZkGroupDeserializationFailure),
     ZkGroupVerificationFailure(ZkGroupVerificationFailure),
@@ -42,7 +45,11 @@ pub enum SignalJniError {
     #[cfg(feature = "signal-media")]
     WebpSanitizeParse(signal_media::sanitize::webp::ParseErrorReport),
     Cdsi(CdsiError),
-    Net(NetError),
+    Svr3(libsignal_net::svr3::Error),
+    WebSocket(#[from] WebSocketServiceError),
+    ChatService(ChatServiceError),
+    InvalidUri(InvalidUri),
+    ConnectTimedOut,
     Bridge(BridgeLayerError),
     #[cfg(feature = "testing-fns")]
     TestingError {
@@ -73,7 +80,7 @@ impl fmt::Display for SignalJniError {
             SignalJniError::Protocol(s) => write!(f, "{}", s),
             SignalJniError::DeviceTransfer(s) => write!(f, "{}", s),
             SignalJniError::HsmEnclave(e) => write!(f, "{}", e),
-            SignalJniError::Sgx(e) => write!(f, "{}", e),
+            SignalJniError::Enclave(e) => write!(f, "{}", e),
             SignalJniError::Pin(e) => write!(f, "{}", e),
             SignalJniError::SignalCrypto(s) => write!(f, "{}", s),
             SignalJniError::ZkGroupVerificationFailure(e) => write!(f, "{}", e),
@@ -87,7 +94,11 @@ impl fmt::Display for SignalJniError {
             #[cfg(feature = "signal-media")]
             SignalJniError::WebpSanitizeParse(e) => write!(f, "{}", e),
             SignalJniError::Cdsi(e) => write!(f, "{}", e),
-            SignalJniError::Net(e) => write!(f, "{}", e),
+            SignalJniError::ChatService(e) => write!(f, "{}", e),
+            SignalJniError::InvalidUri(e) => write!(f, "{}", e),
+            SignalJniError::WebSocket(e) => write!(f, "{e}"),
+            SignalJniError::ConnectTimedOut => write!(f, "connect timed out"),
+            SignalJniError::Svr3(e) => write!(f, "{}", e),
             SignalJniError::Bridge(e) => write!(f, "{}", e),
             #[cfg(feature = "testing-fns")]
             SignalJniError::TestingError { exception_class } => {
@@ -148,9 +159,9 @@ impl From<HsmEnclaveError> for SignalJniError {
     }
 }
 
-impl From<SgxError> for SignalJniError {
-    fn from(e: SgxError) -> SignalJniError {
-        SignalJniError::Sgx(e)
+impl From<EnclaveError> for SignalJniError {
+    fn from(e: EnclaveError) -> SignalJniError {
+        SignalJniError::Enclave(e)
     }
 }
 
@@ -196,6 +207,18 @@ impl From<UsernameLinkError> for SignalJniError {
     }
 }
 
+impl From<InvalidUri> for SignalJniError {
+    fn from(e: InvalidUri) -> Self {
+        SignalJniError::InvalidUri(e)
+    }
+}
+
+impl From<ChatServiceError> for SignalJniError {
+    fn from(e: ChatServiceError) -> Self {
+        SignalJniError::ChatService(e)
+    }
+}
+
 impl From<IoError> for SignalJniError {
     fn from(e: IoError) -> SignalJniError {
         Self::Io(e)
@@ -228,19 +251,26 @@ impl From<libsignal_net::cdsi::LookupError> for SignalJniError {
     fn from(e: libsignal_net::cdsi::LookupError) -> SignalJniError {
         use libsignal_net::cdsi::LookupError;
         SignalJniError::Cdsi(match e {
+            LookupError::ConnectionTimedOut => return SignalJniError::ConnectTimedOut,
             LookupError::AttestationError(e) => return e.into(),
-            LookupError::Net(e) => return e.into(),
+            LookupError::ConnectTransport(e) => return IoError::from(e).into(),
+            LookupError::WebSocket(e) => return e.into(),
+            LookupError::InvalidArgument { server_reason: _ } => {
+                return SignalJniError::Protocol(SignalProtocolError::InvalidArgument(
+                    e.to_string(),
+                ))
+            }
             LookupError::InvalidResponse => CdsiError::InvalidResponse,
             LookupError::Protocol => CdsiError::Protocol,
-            LookupError::RateLimited { retry_after } => CdsiError::RateLimited { retry_after },
+            LookupError::RateLimited {
+                retry_after_seconds,
+            } => CdsiError::RateLimited {
+                retry_after: Duration::from_secs(retry_after_seconds.into()),
+            },
             LookupError::ParseError => CdsiError::ParseError,
+            LookupError::InvalidToken => CdsiError::InvalidToken,
+            LookupError::Server { reason } => CdsiError::Server { reason },
         })
-    }
-}
-
-impl From<NetError> for SignalJniError {
-    fn from(e: NetError) -> SignalJniError {
-        Self::Net(e)
     }
 }
 
@@ -253,6 +283,25 @@ impl From<BridgeLayerError> for SignalJniError {
 impl From<jni::errors::Error> for BridgeLayerError {
     fn from(e: jni::errors::Error) -> BridgeLayerError {
         BridgeLayerError::Jni(e)
+    }
+}
+
+impl From<Svr3Error> for SignalJniError {
+    fn from(err: Svr3Error) -> Self {
+        match err {
+            Svr3Error::Connect(inner) => match inner {
+                WebSocketConnectError::Timeout => SignalJniError::ConnectTimedOut,
+                WebSocketConnectError::Transport(e) => SignalJniError::Io(e.into()),
+                WebSocketConnectError::WebSocketError(e) => WebSocketServiceError::from(e).into(),
+            },
+            Svr3Error::ConnectionTimedOut => SignalJniError::ConnectTimedOut,
+            Svr3Error::Service(inner) => inner.into(),
+            Svr3Error::AttestationError(inner) => inner.into(),
+            Svr3Error::Protocol(_)
+            | Svr3Error::RequestFailed(_)
+            | Svr3Error::RestoreFailed
+            | Svr3Error::DataMissing => SignalJniError::Svr3(err),
+        }
     }
 }
 

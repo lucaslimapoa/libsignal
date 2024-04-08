@@ -3,15 +3,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use libsignal_protocol::*;
-use paste::paste;
-
 use std::ffi::{c_char, c_uchar, CStr};
-use std::num::ParseIntError;
+use std::fmt::Display;
+use std::num::{NonZeroU64, ParseIntError};
 use std::ops::Deref;
 
+use libsignal_protocol::*;
+use paste::paste;
+use uuid::Uuid;
+
 use crate::io::{InputStream, SyncInputStream};
-use crate::support::{FixedLengthBincodeSerializable, Serialized};
+use crate::support::{extend_lifetime, AsType, FixedLengthBincodeSerializable, Serialized};
 
 use super::*;
 
@@ -147,7 +149,7 @@ impl<'a> ArgTypeInfo<'a> for &'a mut [u8] {
     }
 }
 
-impl<'a> ArgTypeInfo<'a> for crate::protocol::ServiceIdSequence<'a> {
+impl<'a> ArgTypeInfo<'a> for crate::support::ServiceIdSequence<'a> {
     type ArgType = <&'a [u8] as ArgTypeInfo<'a>>::ArgType;
     type StoredType = Self::ArgType;
 
@@ -158,6 +160,35 @@ impl<'a> ArgTypeInfo<'a> for crate::protocol::ServiceIdSequence<'a> {
     fn load_from(stored: &'a mut Self::StoredType) -> Self {
         let buffer = <&'a [u8]>::load_from(stored);
         Self::parse(buffer)
+    }
+}
+
+impl<'a> ArgTypeInfo<'a> for Vec<&'a [u8]> {
+    type ArgType = BorrowedSliceOf<BorrowedSliceOf<u8>>;
+    type StoredType = Vec<&'a [u8]>;
+
+    fn borrow(foreign: Self::ArgType) -> SignalFfiResult<Self> {
+        let slices = unsafe { foreign.as_slice()? };
+        slices
+            .iter()
+            .map(|next| unsafe {
+                let next_slice = next.as_slice()?;
+                // The lifetime of `next.as_slice()` is tied to the lifetime of `slices`. However,
+                // we expect all of the slices in the argument to outlive this function call. (We
+                // could make this safer by following the Java bridge in providing the parameter as
+                // a reference rather than a value, at the expense of making the ArgTypeInfo traits
+                // more complicated.)
+                //
+                // We *do* know that 'a won't outlive the function call, because ArgTypeInfo
+                // constrains its 'a to the lifetime of the storage. That's why we're not using
+                // SimpleArgTypeInfo here, even though we could.
+                Ok(extend_lifetime::<'_, 'a, _>(next_slice))
+            })
+            .collect()
+    }
+
+    fn load_from(stored: &'a mut Self::StoredType) -> Self {
+        std::mem::take(stored)
     }
 }
 
@@ -289,6 +320,15 @@ impl SimpleArgTypeInfo for libsignal_net::cdsi::E164 {
     }
 }
 
+impl SimpleArgTypeInfo for Box<[u8]> {
+    type ArgType = BorrowedSliceOf<c_uchar>;
+
+    fn convert_from(foreign: Self::ArgType) -> SignalFfiResult<Self> {
+        let slice = unsafe { foreign.as_slice()? };
+        Ok(slice.into())
+    }
+}
+
 impl<const LEN: usize> SimpleArgTypeInfo for &'_ [u8; LEN] {
     type ArgType = *const [u8; LEN];
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -385,6 +425,14 @@ impl ResultTypeInfo for Box<[String]> {
     type ResultType = StringArray;
     fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
         Ok(StringArray::from_iter(&*self))
+    }
+}
+
+/// Allocates and returns an array of Rust-owned bytestrings.
+impl ResultTypeInfo for Box<[Vec<u8>]> {
+    type ResultType = BytestringArray;
+    fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
+        Ok(BytestringArray::from_iter(&*self))
     }
 }
 
@@ -533,6 +581,26 @@ where
     }
 }
 
+impl<T, P> SimpleArgTypeInfo for AsType<T, P>
+where
+    P: TryInto<T> + SimpleArgTypeInfo,
+    P::Error: Display,
+{
+    type ArgType = P::ArgType;
+
+    fn convert_from(foreign: Self::ArgType) -> SignalFfiResult<Self> {
+        let p = P::convert_from(foreign)?;
+        p.try_into()
+            .map_err(|e| {
+                SignalFfiError::Signal(SignalProtocolError::InvalidArgument(format!(
+                    "invalid {}: {e}",
+                    std::any::type_name::<T>()
+                )))
+            })
+            .map(AsType::from)
+    }
+}
+
 impl<T> ResultTypeInfo for Serialized<T>
 where
     T: FixedLengthBincodeSerializable + serde::Serialize,
@@ -551,6 +619,106 @@ impl ResultTypeInfo for () {
 
     fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
         Ok(false)
+    }
+}
+
+impl ResultTypeInfo for libsignal_net::cdsi::LookupResponse {
+    type ResultType = FfiCdsiLookupResponse;
+    fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
+        let Self {
+            records,
+            debug_permits_used,
+        } = self;
+
+        let entries = records
+            .into_iter()
+            .map(|e| FfiCdsiLookupResponseEntry {
+                e164: NonZeroU64::from(e.e164).into(),
+                aci: e.aci.map(Uuid::from).unwrap_or(Uuid::nil()).into_bytes(),
+                pni: e.pni.map(Uuid::from).unwrap_or(Uuid::nil()).into_bytes(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into();
+
+        Ok(FfiCdsiLookupResponse {
+            entries,
+            debug_permits_used,
+        })
+    }
+}
+
+impl ResultTypeInfo for libsignal_net::chat::Response {
+    type ResultType = FfiChatResponse;
+
+    fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
+        let Self {
+            status,
+            message,
+            body,
+            headers,
+        } = self;
+
+        let header_strings: Vec<*const c_char> = headers
+            .iter()
+            .map(|(k, v)| {
+                // We only support string values for now (see chat_websocket.proto).
+                format!(
+                    "{}:{}",
+                    k,
+                    v.to_str().expect("Chat never produces non-string headers")
+                )
+                .convert_into()
+            })
+            .collect::<SignalFfiResult<_>>()?;
+
+        Ok(FfiChatResponse {
+            status: status.as_u16(),
+            message: message.unwrap_or_default().convert_into()?,
+            headers: OwnedBufferOf::from(header_strings.into_boxed_slice()),
+            body: body.unwrap_or_default().convert_into()?,
+        })
+    }
+}
+
+impl ResultTypeInfo for libsignal_net::chat::DebugInfo {
+    type ResultType = FfiChatServiceDebugInfo;
+
+    fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
+        let Self {
+            connection_reused,
+            reconnect_count,
+            ip_type,
+            duration,
+            connection_info,
+        } = self;
+
+        Ok(FfiChatServiceDebugInfo {
+            connection_reused,
+            reconnect_count,
+            raw_ip_type: ip_type as u8,
+            duration_secs: duration.as_secs_f64(),
+            connection_info: connection_info.convert_into()?,
+        })
+    }
+}
+
+impl ResultTypeInfo for crate::net::ResponseAndDebugInfo {
+    type ResultType = FfiResponseAndDebugInfo;
+
+    fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
+        let Self {
+            response,
+            debug_info,
+        } = self;
+
+        let response = response.convert_into()?;
+        let debug_info = debug_info.convert_into()?;
+
+        Ok(FfiResponseAndDebugInfo {
+            response,
+            debug_info,
+        })
     }
 }
 
@@ -606,6 +774,7 @@ macro_rules! trivial {
 
 trivial!(i32);
 trivial!(u8);
+trivial!(u16);
 trivial!(u32);
 trivial!(u64);
 trivial!(usize);
@@ -620,6 +789,7 @@ trivial!(bool);
 /// to that.
 macro_rules! ffi_arg_type {
     (u8) => (u8);
+    (u16) => (u16);
     (u32) => (u32);
     (u64) => (u64);
     (Option<u32>) => (u32);
@@ -628,6 +798,7 @@ macro_rules! ffi_arg_type {
     (&[u8]) => (ffi::BorrowedSliceOf<std::ffi::c_uchar>);
     (&mut [u8]) => (ffi::BorrowedMutableSliceOf<std::ffi::c_uchar>);
     (ServiceIdSequence<'_>) => (ffi::BorrowedSliceOf<std::ffi::c_uchar>);
+    (Vec<&[u8]>) => (ffi::BorrowedSliceOf<ffi_arg_type!(&[u8])>);
     (String) => (*const std::ffi::c_char);
     (Option<String>) => (*const std::ffi::c_char);
     (Option<&str>) => (*const std::ffi::c_char);
@@ -643,8 +814,10 @@ macro_rules! ffi_arg_type {
     (& $typ:ty) => (*const $typ);
     (&mut $typ:ty) => (*mut $typ);
     (Option<& $typ:ty>) => (*const $typ);
+    (Box<[u8]>) => (ffi::BorrowedSliceOf<std::ffi::c_uchar>);
 
     (Ignored<$typ:ty>) => (*const std::ffi::c_void);
+    (AsType<$typ:ident, $bridged:ident>) => (ffi_arg_type!($bridged));
 
     // In order to provide a fixed-sized array of the correct length,
     // a serialized type FooBar must have a constant FOO_BAR_LEN that's in scope (and exposed to C).
@@ -660,7 +833,8 @@ macro_rules! ffi_result_type {
     // These rules only match a single token for a Result's success type.
     // We can't use `:ty` because we need the resulting tokens to be matched recursively rather than
     // treated as a single unit, and we can't match multiple tokens because Rust's macros match
-    // eagerly. Therefore, if you need to return a more complicated Result type, you'll have to add // another rule for its form.
+    // eagerly. Therefore, if you need to return a more complicated Result type, you'll have to add
+    // another rule for its form.
     (Result<$typ:tt $(, $_:ty)?>) => (ffi_result_type!($typ));
     (Result<&$typ:tt $(, $_:ty)?>) => (ffi_result_type!(&$typ));
     (Result<Option<&$typ:tt> $(, $_:ty)?>) => (ffi_result_type!(&$typ));
@@ -688,6 +862,12 @@ macro_rules! ffi_result_type {
     (&[u8]) => (ffi::OwnedBufferOf<std::ffi::c_uchar>);
     (Vec<u8>) => (ffi::OwnedBufferOf<std::ffi::c_uchar>);
     (Box<[String]>) => (ffi::StringArray);
+    (Box<[Vec<u8>]>) => (ffi::BytestringArray);
+
+    (LookupResponse) => (ffi::FfiCdsiLookupResponse);
+    (ChatResponse) => (ffi::FfiChatResponse);
+    (ChatServiceDebugInfo) => (ffi::FfiChatServiceDebugInfo);
+    (ResponseAndDebugInfo) => (ffi::FfiResponseAndDebugInfo);
 
     // In order to provide a fixed-sized array of the correct length,
     // a serialized type FooBar must have a constant FOO_BAR_LEN that's in scope (and exposed to C).

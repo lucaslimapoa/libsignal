@@ -10,8 +10,10 @@ use futures::io::AllowStdIo;
 use futures::AsyncRead;
 
 use libsignal_message_backup::args::{parse_aci, parse_hex_bytes};
+use libsignal_message_backup::backup::Purpose;
 use libsignal_message_backup::frame::{
-    CursorFactory, FileReaderFactory, FramesReader, ReaderFactory,
+    CursorFactory, FileReaderFactory, FramesReader, ReaderFactory, UnvalidatedHmacReader,
+    VerifyHmac,
 };
 use libsignal_message_backup::key::{BackupKey, MessageBackupKey};
 use libsignal_message_backup::{BackupReader, Error, FoundUnknownField, ReadResult};
@@ -41,6 +43,10 @@ struct Cli {
     /// when set, the validated backup contents are printed to stdout
     #[arg(long)]
     print: bool,
+
+    /// the purpose the backup is intended for
+    #[arg(long, default_value_t=Purpose::RemoteBackup)]
+    purpose: Purpose,
 
     // TODO once https://github.com/clap-rs/clap/issues/5092 is resolved, make
     // `derive_key` and `key_parts` Optional at the top level.
@@ -88,6 +94,7 @@ async fn async_main() {
 
         key_parts,
 
+        purpose,
         print,
         verbose,
     } = Cli::parse();
@@ -130,13 +137,14 @@ async fn async_main() {
 
     let reader = if let Some(key) = key {
         MaybeEncryptedBackupReader::EncryptedCompressed(Box::new(
-            BackupReader::new_encrypted_compressed(&key, factory)
+            BackupReader::new_encrypted_compressed(&key, factory, purpose)
                 .await
                 .unwrap_or_else(|e| panic!("invalid encrypted backup: {e:#}")),
         ))
     } else {
         MaybeEncryptedBackupReader::PlaintextBinproto(BackupReader::new_unencrypted(
             factory.make_reader().expect("failed to read"),
+            purpose,
         ))
     };
 
@@ -209,7 +217,7 @@ impl<'a> ReaderFactory for AsyncReaderFactory<'a> {
 /// Wrapper over encrypted- or plaintext-sourced [`BackupReader`].
 enum MaybeEncryptedBackupReader<R: AsyncRead + Unpin> {
     EncryptedCompressed(Box<BackupReader<FramesReader<R>>>),
-    PlaintextBinproto(BackupReader<R>),
+    PlaintextBinproto(BackupReader<UnvalidatedHmacReader<R>>),
 }
 
 struct PrintOutput(bool);
@@ -217,7 +225,7 @@ struct PrintOutput(bool);
 impl<R: AsyncRead + Unpin> MaybeEncryptedBackupReader<R> {
     async fn execute(self, print: PrintOutput, verbosity: ParseVerbosity) -> Result<(), Error> {
         async fn validate(
-            mut backup_reader: BackupReader<impl AsyncRead + Unpin>,
+            mut backup_reader: BackupReader<impl AsyncRead + Unpin + VerifyHmac>,
             PrintOutput(print): PrintOutput,
             verbosity: ParseVerbosity,
         ) -> Result<(), Error> {
@@ -260,6 +268,7 @@ fn print_unknown_fields(found_unknown_fields: Vec<FoundUnknownField>) {
 mod test {
     use assert_matches::assert_matches;
     use clap_stdin::FileOrStdin;
+    use test_case::test_case;
 
     use super::*;
 
@@ -285,6 +294,7 @@ mod test {
                 },
             verbose: 0,
             print: false,
+            purpose: Purpose::RemoteBackup,
             derive_key: DeriveKey { master_key: None, aci: None},
             key_parts: KeyParts { hmac_key: None, aes_key: None, iv: None },
         }) =>  file_source);
@@ -310,6 +320,7 @@ mod test {
                 },
             verbose: 0,
             print: false,
+            purpose: Purpose::RemoteBackup,
             derive_key,
             key_parts: KeyParts { hmac_key: None, aes_key: None, iv: None },
         }) => (file_source, derive_key));
@@ -344,6 +355,7 @@ mod test {
                 },
             verbose: 0,
             print: false,
+            purpose: Purpose::RemoteBackup,
             derive_key: DeriveKey { master_key: None, aci: None},
             key_parts,
         }) => (file_source, key_parts));
@@ -417,5 +429,17 @@ mod test {
 
             assert!(e.to_string().contains("--aci <ACI>"), "{e}");
         }
+    }
+
+    #[test_case("backup", Purpose::RemoteBackup; "remote")]
+    #[test_case("remote_backup", Purpose::RemoteBackup; "remote underscore")]
+    #[test_case("remote-backup", Purpose::RemoteBackup; "remote hyphen")]
+    #[test_case("transfer", Purpose::DeviceTransfer; "transfer")]
+    #[test_case("device-transfer", Purpose::DeviceTransfer; "transfer hyphen")]
+    #[test_case("device_transfer", Purpose::DeviceTransfer; "transfer underscore")]
+    fn cli_parse_purpose(purpose_flag: &str, expected_purpose: Purpose) {
+        let input = [EXECUTABLE_NAME, "filename", "--purpose", purpose_flag];
+        let cli = Cli::try_parse_from(input).expect("parse failed");
+        assert_eq!(cli.purpose, expected_purpose);
     }
 }

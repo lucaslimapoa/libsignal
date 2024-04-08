@@ -72,62 +72,6 @@ impl From<u64> for Timestamp {
     }
 }
 
-/// Lazily parses ServiceIds from a buffer of concatenated Service-Id-FixedWidthBinary.
-///
-/// **Reports parse errors by panicking.** All errors represent mistakes on the app side of the
-/// bridge, though; a buffer that really is constructed from concatenating service IDs should never
-/// error.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ServiceIdSequence<'a>(&'a [u8]);
-
-impl<'a> ServiceIdSequence<'a> {
-    const SERVICE_ID_FIXED_WIDTH_BINARY_LEN: usize =
-        std::mem::size_of::<ServiceIdFixedWidthBinaryBytes>();
-
-    pub(crate) fn parse(input: &'a [u8]) -> Self {
-        let extra_bytes = input.len() % Self::SERVICE_ID_FIXED_WIDTH_BINARY_LEN;
-        assert!(
-            extra_bytes == 0,
-            concat!(
-                "input should be a concatenated list of Service-Id-FixedWidthBinary, ",
-                "but has length {} ({} extra bytes)"
-            ),
-            input.len(),
-            extra_bytes
-        );
-        Self(input)
-    }
-}
-
-impl Iterator for ServiceIdSequence<'_> {
-    type Item = ServiceId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.0.is_empty() {
-            None
-        } else {
-            let (next, rest) = self.0.split_at(Self::SERVICE_ID_FIXED_WIDTH_BINARY_LEN);
-            self.0 = rest;
-            Some(
-                ServiceId::parse_from_service_id_fixed_width_binary(
-                    next.try_into().expect("just measured above"),
-                )
-                .expect(concat!(
-                    "input should be a concatenated list of Service-Id-FixedWidthBinary, ",
-                    "but one ServiceId was invalid"
-                )),
-            )
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.0.len() / Self::SERVICE_ID_FIXED_WIDTH_BINARY_LEN;
-        (len, Some(len))
-    }
-}
-
-impl ExactSizeIterator for ServiceIdSequence<'_> {}
-
 #[bridge_fn(ffi = false)]
 fn HKDF_DeriveSecrets(
     output_length: u32,
@@ -146,7 +90,7 @@ fn HKDF_DeriveSecrets(
 }
 
 // Alternate implementation to fill an existing buffer.
-#[bridge_fn_void(jni = false, node = false)]
+#[bridge_fn(jni = false, node = false)]
 fn HKDF_Derive(output: &mut [u8], ikm: &[u8], label: &[u8], salt: &[u8]) -> Result<()> {
     hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), ikm)
         .expand(label, output)
@@ -215,8 +159,16 @@ bridge_get!(
     ffi = "publickey_get_public_key_bytes",
     jni = "ECPublicKey_1GetPublicKeyBytes"
 );
-bridge_get!(ProtocolAddress::device_id as DeviceId -> u32, ffi = "address_get_device_id");
-bridge_get!(ProtocolAddress::name as Name -> &str, ffi = "address_get_name");
+
+#[bridge_fn(ffi = "address_get_device_id")]
+fn ProtocolAddress_DeviceId(obj: &ProtocolAddress) -> u32 {
+    obj.device_id().into()
+}
+
+#[bridge_fn(ffi = "address_get_name")]
+fn ProtocolAddress_Name(obj: &ProtocolAddress) -> &str {
+    obj.name()
+}
 
 #[bridge_fn(ffi = "publickey_equals", node = "PublicKey_Equals")]
 fn ECPublicKey_Equals(lhs: &PublicKey, rhs: &PublicKey) -> bool {
@@ -1009,7 +961,7 @@ fn SessionRecord_GetSessionVersion(s: &SessionRecord) -> Result<u32> {
     }
 }
 
-#[bridge_fn_void]
+#[bridge_fn]
 fn SessionRecord_ArchiveCurrentState(session_record: &mut SessionRecord) -> Result<()> {
     session_record.archive_current_state()
 }
@@ -1136,7 +1088,7 @@ fn SessionRecord_InitializeBobSession(
 
 // End SessionRecord testing functions
 
-#[bridge_fn_void(ffi = "process_prekey_bundle")]
+#[bridge_fn(ffi = "process_prekey_bundle")]
 async fn SessionBuilder_ProcessPreKeyBundle(
     bundle: &PreKeyBundle,
     protocol_address: &ProtocolAddress,
@@ -1333,7 +1285,7 @@ async fn SenderKeyDistributionMessage_Create(
     create_sender_key_distribution_message(sender, distribution_id, store, &mut csprng).await
 }
 
-#[bridge_fn_void(
+#[bridge_fn(
     ffi = "process_sender_key_distribution_message",
     jni = "GroupSessionBuilder_1ProcessSenderKeyDistributionMessage"
 )]

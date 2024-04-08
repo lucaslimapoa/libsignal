@@ -5,10 +5,13 @@
 
 package org.signal.libsignal.protocol;
 
+import static org.signal.libsignal.internal.FilterExceptions.filterExceptions;
+
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.List;
+import java.util.Collection;
 import java.util.UUID;
+import org.signal.libsignal.internal.CalledFromNative;
 import org.signal.libsignal.internal.Native;
 
 public abstract class ServiceId {
@@ -85,7 +88,7 @@ public abstract class ServiceId {
     }
     byte[] storage;
     try {
-      storage = Native.ServiceId_ParseFromServiceIdString(serviceIdString);
+      storage = filterExceptions(() -> Native.ServiceId_ParseFromServiceIdString(serviceIdString));
     } catch (IllegalArgumentException ex) {
       throw new InvalidServiceIdException();
     }
@@ -98,13 +101,14 @@ public abstract class ServiceId {
     }
     byte[] storage;
     try {
-      storage = Native.ServiceId_ParseFromServiceIdBinary(serviceIdBinary);
+      storage = filterExceptions(() -> Native.ServiceId_ParseFromServiceIdBinary(serviceIdBinary));
     } catch (IllegalArgumentException ex) {
       throw new InvalidServiceIdException();
     }
     return parseFromFixedWidthBinary(storage);
   }
 
+  @CalledFromNative
   public static ServiceId parseFromFixedWidthBinary(byte[] storage)
       throws InvalidServiceIdException {
     if (storage == null) {
@@ -121,7 +125,7 @@ public abstract class ServiceId {
     }
   }
 
-  public static byte[] toConcatenatedFixedWidthBinary(List<ServiceId> serviceIds) {
+  public static byte[] toConcatenatedFixedWidthBinary(Collection<ServiceId> serviceIds) {
     byte[] result = new byte[FIXED_WIDTH_BINARY_LENGTH * serviceIds.size()];
     int offset = 0;
     for (ServiceId next : serviceIds) {

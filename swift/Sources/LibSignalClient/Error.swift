@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-import SignalFfi
 import Foundation
+import SignalFfi
 
 #if canImport(SignalCoreKit)
 import SignalCoreKit
@@ -53,6 +53,15 @@ public enum SignalError: Error {
     case invalidMediaInput(String)
     case unsupportedMediaInput(String)
     case callbackError(String)
+    case webSocketError(String)
+    case connectionTimeoutError(String)
+    case networkProtocolError(String)
+    case cdsiInvalidToken(String)
+    case rateLimitedError(retryAfter: TimeInterval, message: String)
+    case svrDataMissing(String)
+    case svrRestoreFailed(String)
+    case chatServiceInactive(String)
+
     case unknown(UInt32, String)
 }
 
@@ -159,6 +168,25 @@ internal func checkError(_ error: SignalFfiErrorRef?) throws {
         throw SignalError.unsupportedMediaInput(errStr)
     case SignalErrorCodeCallbackError:
         throw SignalError.callbackError(errStr)
+    case SignalErrorCodeWebSocket:
+        throw SignalError.webSocketError(errStr)
+    case SignalErrorCodeConnectionTimedOut:
+        throw SignalError.connectionTimeoutError(errStr)
+    case SignalErrorCodeNetworkProtocol:
+        throw SignalError.networkProtocolError(errStr)
+    case SignalErrorCodeCdsiInvalidToken:
+        throw SignalError.cdsiInvalidToken(errStr)
+    case SignalErrorCodeRateLimited:
+        let retryAfterSeconds = try invokeFnReturningInteger {
+            signal_error_get_retry_after_seconds(error, $0)
+        }
+        throw SignalError.rateLimitedError(retryAfter: TimeInterval(retryAfterSeconds), message: errStr)
+    case SignalErrorCodeSvrDataMissing:
+        throw SignalError.svrDataMissing(errStr)
+    case SignalErrorCodeSvrRestoreFailed:
+        throw SignalError.svrRestoreFailed(errStr)
+    case SignalErrorCodeChatServiceInactive:
+        throw SignalError.chatServiceInactive(errStr)
     default:
         throw SignalError.unknown(errType, errStr)
     }

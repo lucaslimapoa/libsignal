@@ -4,6 +4,8 @@
 //
 use std::fmt;
 
+use libsignal_net::chat::ChatServiceError;
+use libsignal_net::svr3::Error as Svr3Error;
 use paste::paste;
 use signal_media::sanitize::mp4::{Error as Mp4Error, ParseError as Mp4ParseError};
 use signal_media::sanitize::webp::{Error as WebpError, ParseError as WebpParseError};
@@ -16,7 +18,7 @@ const ERROR_CLASS_NAME: &str = "LibSignalErrorBase";
 #[allow(non_snake_case)]
 fn node_registerErrors(mut cx: FunctionContext) -> JsResult<JsValue> {
     let errors_module = cx.argument::<JsObject>(0)?;
-    cx.this()
+    cx.this::<JsObject>()?
         .set(&mut cx, ERRORS_PROPERTY_NAME, errors_module)?;
     Ok(cx.undefined().upcast())
 }
@@ -74,10 +76,7 @@ pub(crate) enum ThrownException {
 }
 
 impl ThrownException {
-    pub(crate) fn from_value<'a>(
-        cx: &mut CallContext<'a, JsObject>,
-        error: Handle<'a, JsValue>,
-    ) -> Self {
+    pub(crate) fn from_value<'a>(cx: &mut FunctionContext<'a>, error: Handle<'a, JsValue>) -> Self {
         if let Ok(e) = error.downcast::<JsError, _>(cx) {
             ThrownException::Error(e.root(cx))
         } else if let Ok(e) = error.downcast::<JsString, _>(cx) {
@@ -134,10 +133,14 @@ pub trait SignalNodeError: Sized + fmt::Display {
     }
 }
 
-const RATE_LIMITED_ERROR: &str = "RateLimitedError";
-const IO_ERROR: &str = "IoError";
 const INVALID_MEDIA_INPUT: &str = "InvalidMediaInput";
+const IO_ERROR: &str = "IoError";
+const RATE_LIMITED_ERROR: &str = "RateLimitedError";
+const SVR3_DATA_MISSING: &str = "SvrDataMissing";
+const SVR3_REQUEST_FAILED: &str = "SvrRequestFailed";
+const SVR3_RESTORE_FAILED: &str = "SvrRestoreFailed";
 const UNSUPPORTED_MEDIA_INPUT: &str = "UnsupportedMediaInput";
+const CHAT_SERVICE_INACTIVE: &str = "ChatServiceInactive";
 
 impl SignalNodeError for neon::result::Throw {
     fn throw<'a>(
@@ -395,6 +398,47 @@ impl SignalNodeError for std::io::Error {
     }
 }
 
+impl SignalNodeError for libsignal_net::chat::ChatServiceError {
+    fn throw<'a>(
+        self,
+        cx: &mut impl Context<'a>,
+        module: Handle<'a, JsObject>,
+        operation_name: &str,
+    ) -> JsResult<'a, JsValue> {
+        let name = match self {
+            ChatServiceError::ServiceInactive => Some(CHAT_SERVICE_INACTIVE),
+            _ => Some(IO_ERROR),
+        };
+        let message = self.to_string();
+        match new_js_error(cx, module, name, &message, operation_name, None) {
+            Some(error) => cx.throw(error),
+            None => {
+                // Make sure we still throw something.
+                cx.throw_error(message)
+            }
+        }
+    }
+}
+
+impl SignalNodeError for http::uri::InvalidUri {
+    fn throw<'a>(
+        self,
+        cx: &mut impl Context<'a>,
+        module: Handle<'a, JsObject>,
+        operation_name: &str,
+    ) -> JsResult<'a, JsValue> {
+        let name = Some("InvalidUri");
+        let message = self.to_string();
+        match new_js_error(cx, module, name, &message, operation_name, None) {
+            Some(error) => cx.throw(error),
+            None => {
+                // Make sure we still throw something.
+                cx.throw_error(message)
+            }
+        }
+    }
+}
+
 impl SignalNodeError for libsignal_net::cdsi::LookupError {
     fn throw<'a>(
         self,
@@ -403,33 +447,64 @@ impl SignalNodeError for libsignal_net::cdsi::LookupError {
         operation_name: &str,
     ) -> JsResult<'a, JsValue> {
         let (name, extra_props) = match self {
-            Self::RateLimited { retry_after } => (
-                RATE_LIMITED_ERROR,
+            Self::RateLimited {
+                retry_after_seconds,
+            } => (
+                Some(RATE_LIMITED_ERROR),
                 Some({
                     let props = cx.empty_object();
-                    let retry_after = retry_after.as_secs().convert_into(cx)?;
+                    let retry_after = retry_after_seconds.convert_into(cx)?;
                     props.set(cx, "retryAfterSecs", retry_after)?;
                     props
                 }),
             ),
-            Self::Net(_)
+            Self::AttestationError(e) => return e.throw(cx, module, operation_name),
+            Self::InvalidArgument { server_reason: _ } => (None, None),
+            Self::InvalidToken => (Some("CdsiInvalidToken"), None),
+            Self::ConnectionTimedOut
+            | Self::ConnectTransport(_)
+            | Self::WebSocket(_)
             | Self::Protocol
-            | Self::AttestationError(_)
             | Self::InvalidResponse
-            | Self::ParseError => (IO_ERROR, None),
+            | Self::ParseError
+            | Self::Server { reason: _ } => (Some(IO_ERROR), None),
         };
         let message = self.to_string();
-        new_js_error(
-            cx,
-            module,
-            Some(name),
-            &message,
-            operation_name,
-            extra_props,
-        )
-        .map(|e| cx.throw(e))
-        // Make sure we still throw something.
-        .unwrap_or_else(|| cx.throw_error(&message))
+        new_js_error(cx, module, name, &message, operation_name, extra_props)
+            .map(|e| cx.throw(e))
+            // Make sure we still throw something.
+            .unwrap_or_else(|| cx.throw_error(&message))
+    }
+}
+
+impl SignalNodeError for libsignal_net::svr3::Error {
+    fn throw<'a>(
+        self,
+        cx: &mut impl Context<'a>,
+        module: Handle<'a, JsObject>,
+        operation_name: &str,
+    ) -> JsResult<'a, JsValue> {
+        let name = match self {
+            Svr3Error::Service(_) | Svr3Error::ConnectionTimedOut | Svr3Error::Connect(_) => {
+                Some(IO_ERROR)
+            }
+            Svr3Error::AttestationError(inner) => {
+                return inner.throw(cx, module, operation_name);
+            }
+            Svr3Error::RequestFailed(_) => Some(SVR3_REQUEST_FAILED),
+            Svr3Error::RestoreFailed => Some(SVR3_RESTORE_FAILED),
+            Svr3Error::DataMissing => Some(SVR3_DATA_MISSING),
+            Svr3Error::Protocol(_) => None,
+        };
+
+        let message = self.to_string();
+        match new_js_error(cx, module, name, &message, operation_name, None) {
+            Some(error) => cx.throw(error),
+            None => {
+                // Make sure we still throw something.
+                cx.throw_error(message)
+            }
+        }
     }
 }
 

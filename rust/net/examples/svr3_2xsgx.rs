@@ -14,17 +14,18 @@ use std::time::Duration;
 use base64::prelude::{Engine, BASE64_STANDARD};
 use clap::Parser;
 use hex_literal::hex;
+use libsignal_net::infra::dns::DnsResolver;
 use nonzero_ext::nonzero;
 use rand_core::{CryptoRngCore, OsRng, RngCore};
 
 use attest::svr2::RaftConfig;
 use libsignal_net::auth::Auth;
 use libsignal_net::enclave::{
-    EnclaveEndpoint, EndpointConnection, MrEnclave, PpssSetup, Sgx, Svr3Flavor,
+    EnclaveEndpoint, EnclaveEndpointConnection, MrEnclave, PpssSetup, Sgx, Svr3Flavor,
 };
 use libsignal_net::env::DomainConfig;
 use libsignal_net::infra::certs::RootCertificates;
-use libsignal_net::infra::TcpSslTransportConnector;
+use libsignal_net::infra::tcp_ssl::DirectConnector as TcpSslTransportConnector;
 use libsignal_net::svr::SvrConnection;
 use libsignal_net::svr3::{OpaqueMaskedShareSet, PpssOps};
 
@@ -49,12 +50,13 @@ where
     A: Svr3Flavor,
     B: Svr3Flavor;
 
-impl<'a, A, B> PpssSetup for TwoForTwoEnv<'a, A, B>
+impl<'a, A, B, S> PpssSetup<S> for TwoForTwoEnv<'a, A, B>
 where
     A: Svr3Flavor + Send,
     B: Svr3Flavor + Send,
+    S: Send,
 {
-    type Connections = (SvrConnection<A>, SvrConnection<B>);
+    type Connections = (SvrConnection<A, S>, SvrConnection<B, S>);
     type ServerIds = [u64; 2];
 
     fn server_ids() -> Self::ServerIds {
@@ -106,25 +108,24 @@ async fn main() {
     let (uid_a, uid_b) = (make_uid(), make_uid());
 
     let connect = || async {
-        let connection_a = EndpointConnection::with_custom_properties(
+        let connector = TcpSslTransportConnector::new(DnsResolver::default());
+        let connection_a = EnclaveEndpointConnection::with_custom_properties(
             two_sgx_env.0,
             Duration::from_secs(10),
-            TcpSslTransportConnector,
             Some(&TEST_SERVER_RAFT_CONFIG),
         );
 
-        let a = SvrConnection::connect(make_auth(uid_a), &connection_a)
+        let a = SvrConnection::connect(make_auth(uid_a), &connection_a, connector.clone())
             .await
             .expect("can attestedly connect");
 
-        let connection_b = EndpointConnection::with_custom_properties(
+        let connection_b = EnclaveEndpointConnection::with_custom_properties(
             two_sgx_env.1,
             Duration::from_secs(10),
-            TcpSslTransportConnector,
             Some(&TEST_SERVER_RAFT_CONFIG),
         );
 
-        let b = SvrConnection::connect(make_auth(uid_b), &connection_b)
+        let b = SvrConnection::connect(make_auth(uid_b), &connection_b, connector)
             .await
             .expect("can attestedly connect");
         (a, b)

@@ -16,10 +16,7 @@ export { default as NotarySignature } from './NotarySignature';
 export { default as ClientZkAuthOperations } from './auth/ClientZkAuthOperations';
 export { default as ServerZkAuthOperations } from './auth/ServerZkAuthOperations';
 
-export { default as AuthCredential } from './auth/AuthCredential';
-export { default as AuthCredentialResponse } from './auth/AuthCredentialResponse';
 export { default as AuthCredentialPresentation } from './auth/AuthCredentialPresentation';
-
 export { default as AuthCredentialWithPni } from './auth/AuthCredentialWithPni';
 export { default as AuthCredentialWithPniResponse } from './auth/AuthCredentialWithPniResponse';
 
@@ -79,6 +76,8 @@ export { default as BackupAuthCredentialResponse } from './backups/BackupAuthCre
 
 // Group Send
 
-export { default as GroupSendCredential } from './groupsend/GroupSendCredential';
-export { default as GroupSendCredentialPresentation } from './groupsend/GroupSendCredentialPresentation';
-export { default as GroupSendCredentialResponse } from './groupsend/GroupSendCredentialResponse';
+export { default as GroupSendDerivedKeyPair } from './groupsend/GroupSendDerivedKeyPair';
+export { default as GroupSendEndorsement } from './groupsend/GroupSendEndorsement';
+export { default as GroupSendEndorsementsResponse } from './groupsend/GroupSendEndorsementsResponse';
+export { default as GroupSendFullToken } from './groupsend/GroupSendFullToken';
+export { default as GroupSendToken } from './groupsend/GroupSendToken';

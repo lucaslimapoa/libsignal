@@ -5,6 +5,7 @@
 
 package org.signal.libsignal.zkgroup.auth;
 
+import static org.signal.libsignal.internal.FilterExceptions.filterExceptions;
 import static org.signal.libsignal.zkgroup.internal.Constants.RANDOM_LENGTH;
 
 import java.security.SecureRandom;
@@ -23,30 +24,6 @@ public class ServerZkAuthOperations {
 
   public ServerZkAuthOperations(ServerSecretParams serverSecretParams) {
     this.serverSecretParams = serverSecretParams;
-  }
-
-  public AuthCredentialResponse issueAuthCredential(Aci aci, int redemptionTime) {
-    return issueAuthCredential(new SecureRandom(), aci, redemptionTime);
-  }
-
-  public AuthCredentialResponse issueAuthCredential(
-      SecureRandom secureRandom, Aci aci, int redemptionTime) {
-    byte[] random = new byte[RANDOM_LENGTH];
-
-    secureRandom.nextBytes(random);
-
-    byte[] newContents =
-        Native.ServerSecretParams_IssueAuthCredentialDeterministic(
-            serverSecretParams.getInternalContentsForJNI(),
-            random,
-            aci.toServiceIdFixedWidthBinary(),
-            redemptionTime);
-
-    try {
-      return new AuthCredentialResponse(newContents);
-    } catch (InvalidInputException e) {
-      throw new AssertionError(e);
-    }
   }
 
   public AuthCredentialWithPniResponse issueAuthCredentialWithPniAsServiceId(
@@ -101,6 +78,32 @@ public class ServerZkAuthOperations {
     }
   }
 
+  public AuthCredentialWithPniResponse issueAuthCredentialWithPniZkc(
+      Aci aci, Pni pni, Instant redemptionTime) {
+    return issueAuthCredentialWithPniZkc(new SecureRandom(), aci, pni, redemptionTime);
+  }
+
+  public AuthCredentialWithPniResponse issueAuthCredentialWithPniZkc(
+      SecureRandom secureRandom, Aci aci, Pni pni, Instant redemptionTime) {
+    byte[] random = new byte[RANDOM_LENGTH];
+
+    secureRandom.nextBytes(random);
+
+    byte[] newContents =
+        Native.ServerSecretParams_IssueAuthCredentialWithPniZkcDeterministic(
+            serverSecretParams.getInternalContentsForJNI(),
+            random,
+            aci.toServiceIdFixedWidthBinary(),
+            pni.toServiceIdFixedWidthBinary(),
+            redemptionTime.getEpochSecond());
+
+    try {
+      return new AuthCredentialWithPniResponse(newContents);
+    } catch (InvalidInputException e) {
+      throw new AssertionError(e);
+    }
+  }
+
   public void verifyAuthCredentialPresentation(
       GroupPublicParams groupPublicParams, AuthCredentialPresentation authCredentialPresentation)
       throws VerificationFailedException {
@@ -112,10 +115,13 @@ public class ServerZkAuthOperations {
       AuthCredentialPresentation authCredentialPresentation,
       Instant currentTime)
       throws VerificationFailedException {
-    Native.ServerSecretParams_VerifyAuthCredentialPresentation(
-        serverSecretParams.getInternalContentsForJNI(),
-        groupPublicParams.getInternalContentsForJNI(),
-        authCredentialPresentation.getInternalContentsForJNI(),
-        currentTime.getEpochSecond());
+    filterExceptions(
+        VerificationFailedException.class,
+        () ->
+            Native.ServerSecretParams_VerifyAuthCredentialPresentation(
+                serverSecretParams.getInternalContentsForJNI(),
+                groupPublicParams.getInternalContentsForJNI(),
+                authCredentialPresentation.getInternalContentsForJNI(),
+                currentTime.getEpochSecond()));
   }
 }

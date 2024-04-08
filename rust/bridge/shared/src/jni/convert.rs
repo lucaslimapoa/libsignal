@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use jni::objects::{AutoLocal, JMap, JObjectArray};
+use jni::objects::{AutoLocal, JByteBuffer, JMap, JObjectArray};
 use jni::sys::{jbyte, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use libsignal_net::cdsi::LookupResponseEntry;
@@ -16,7 +16,8 @@ use std::ops::Deref;
 
 use crate::io::{InputStream, SyncInputStream};
 use crate::message_backup::MessageBackupValidationOutcome;
-use crate::support::{Array, FixedLengthBincodeSerializable, Serialized};
+use crate::net::ResponseAndDebugInfo;
+use crate::support::{Array, AsType, FixedLengthBincodeSerializable, Serialized};
 
 use super::*;
 
@@ -225,6 +226,15 @@ impl SimpleArgTypeInfo<'_> for u8 {
     }
 }
 
+/// Supports all valid u16 values `0..=65536`.
+impl SimpleArgTypeInfo<'_> for u16 {
+    type ArgType = jint;
+    fn convert_from(_env: &mut JNIEnv, foreign: &jint) -> Result<Self, BridgeLayerError> {
+        u16::try_from(*foreign)
+            .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{} to u16", foreign)))
+    }
+}
+
 impl<'a> SimpleArgTypeInfo<'a> for String {
     type ArgType = JString<'a>;
     fn convert_from(env: &mut JNIEnv, foreign: &JString<'a>) -> Result<Self, BridgeLayerError> {
@@ -272,6 +282,18 @@ impl<'a> SimpleArgTypeInfo<'a> for libsignal_net::cdsi::E164 {
             BridgeLayerError::BadArgument(format!("{e164} is not an e164"))
         })?;
         Ok(e164)
+    }
+}
+
+impl<'a> SimpleArgTypeInfo<'a> for Box<[u8]> {
+    type ArgType = JByteArray<'a>;
+
+    fn convert_from(
+        env: &mut JNIEnv<'a>,
+        foreign: &Self::ArgType,
+    ) -> Result<Self, BridgeLayerError> {
+        let vec = env.convert_byte_array(foreign)?;
+        Ok(vec.into_boxed_slice())
     }
 }
 
@@ -330,7 +352,7 @@ impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param,
 }
 
 impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param, 'context>
-    for crate::protocol::ServiceIdSequence<'storage>
+    for crate::support::ServiceIdSequence<'storage>
 {
     type ArgType = JByteArray<'context>;
     type StoredType = AutoElements<'context, 'context, 'param, jbyte>;
@@ -345,6 +367,45 @@ impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param,
     fn load_from(stored: &'storage mut Self::StoredType) -> Self {
         let buffer = <&'storage [u8]>::load_from(stored);
         Self::parse(buffer)
+    }
+}
+
+/// Represents a sequence of byte arrays as `ByteBuffer[]`.
+///
+/// We use a ByteBuffer instead of a `byte[]` because ByteBuffer can expose its storage without
+/// having to "release" it afterwards; as long as the object is live, the storage is valid. By
+/// contrast, `byte[][]` can't have all of its elements borrowed at once, because the `jni` crate is
+/// strict about the lifetimes for that.
+impl<'a> SimpleArgTypeInfo<'a> for Vec<&'a [u8]> {
+    type ArgType = JObjectArray<'a>;
+
+    fn convert_from(
+        env: &mut JNIEnv<'a>,
+        foreign: &Self::ArgType,
+    ) -> Result<Self, BridgeLayerError> {
+        let len = env.get_array_length(foreign)?;
+        let slices: Vec<&[u8]> = (0..len)
+            .map(|i| {
+                let next = AutoLocal::new(
+                    JByteBuffer::from(env.get_object_array_element(foreign, i)?),
+                    env,
+                );
+                let len = env.get_direct_buffer_capacity(&next)?;
+                let addr = env.get_direct_buffer_address(&next)?;
+                if !addr.is_null() {
+                    Ok(unsafe { std::slice::from_raw_parts(addr, len) })
+                } else {
+                    if len != 0 {
+                        return Err(BridgeLayerError::NullPointer(Some(
+                            "ByteBuffer direct address",
+                        )));
+                    }
+                    Ok([].as_slice())
+                }
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(slices)
     }
 }
 
@@ -823,6 +884,29 @@ where
     }
 }
 
+impl<'a, T, P> SimpleArgTypeInfo<'a> for AsType<T, P>
+where
+    P: SimpleArgTypeInfo<'a> + TryInto<T>,
+    P::Error: Display,
+{
+    type ArgType = P::ArgType;
+
+    fn convert_from(
+        env: &mut JNIEnv<'a>,
+        foreign: &Self::ArgType,
+    ) -> Result<Self, BridgeLayerError> {
+        let p = P::convert_from(env, foreign)?;
+        p.try_into()
+            .map_err(|e| {
+                BridgeLayerError::BadArgument(format!(
+                    "invalid {}: {e}",
+                    std::any::type_name::<T>()
+                ))
+            })
+            .map(AsType::from)
+    }
+}
+
 impl<'a> SimpleArgTypeInfo<'a> for ServiceId {
     type ArgType = JByteArray<'a>;
     fn convert_from(env: &mut JNIEnv, foreign: &Self::ArgType) -> Result<Self, BridgeLayerError> {
@@ -947,12 +1031,150 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::cdsi::LookupResponse {
     }
 }
 
-fn make_string_array<'a, It: IntoIterator>(
+impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::Response {
+    type ResultType = JObject<'a>;
+
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        let Self {
+            status,
+            message,
+            body,
+            headers,
+        } = self;
+
+        // body
+        let body = body.as_deref().unwrap_or(&[]);
+        let body_arr = env.byte_array_from_slice(body)?;
+
+        // message
+        let message_local = env.new_string(message.as_deref().unwrap_or(""))?;
+
+        // headers
+        let headers_map = new_object(
+            env,
+            jni_class_name!(java.util.HashMap),
+            jni_args!(() -> void),
+        )?;
+        let headers_jmap = JMap::from_env(env, &headers_map)?;
+        for (name, value) in headers.iter() {
+            let name_str = env.new_string(name.as_str())?;
+            let value_str = env.new_string(value.to_str().expect("valid header value"))?;
+            headers_jmap.put(env, &name_str, &value_str)?;
+        }
+
+        let class = {
+            const RESPONSE_CLASS: &str =
+                jni_class_name!(org.signal.libsignal.net.ChatService::Response);
+            get_preloaded_class(env, RESPONSE_CLASS)
+                .transpose()
+                .unwrap_or_else(|| env.find_class(RESPONSE_CLASS))?
+        };
+
+        Ok(new_object(
+            env,
+            class,
+            jni_args!((
+                status.as_u16().into() => int,
+                message_local => java.lang.String,
+                headers_jmap => java.util.Map,
+                body_arr => [byte]
+            ) -> void),
+        )?)
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::DebugInfo {
+    type ResultType = JObject<'a>;
+
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        let Self {
+            connection_reused,
+            reconnect_count,
+            ip_type,
+            duration,
+            connection_info,
+        } = self;
+
+        // reconnect count as i32
+        let reconnect_count_i32: i32 = reconnect_count.try_into().expect("within i32 range");
+
+        // ip type as code
+        let ip_type_byte = ip_type as i8;
+
+        // duration as millis
+        let duration_ms: i32 = duration.as_millis().try_into().expect("within i32 range");
+
+        // connection info string
+        let connection_info_string = env.new_string(connection_info)?;
+
+        let class = {
+            const RESPONSE_CLASS: &str =
+                jni_class_name!(org.signal.libsignal.net.ChatService::DebugInfo);
+            get_preloaded_class(env, RESPONSE_CLASS)
+                .transpose()
+                .unwrap_or_else(|| env.find_class(RESPONSE_CLASS))?
+        };
+
+        Ok(new_object(
+            env,
+            class,
+            jni_args!((
+                connection_reused => boolean,
+                reconnect_count_i32 => int,
+                ip_type_byte => byte,
+                duration_ms => int,
+                connection_info_string => java.lang.String,
+            ) -> void),
+        )?)
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for ResponseAndDebugInfo {
+    type ResultType = JObject<'a>;
+
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        let Self {
+            response,
+            debug_info,
+        } = self;
+
+        let response: JObject<'a> = response.convert_into(env)?;
+        let debug_info: JObject<'a> = debug_info.convert_into(env)?;
+
+        let class = {
+            const RESPONSE_CLASS: &str =
+                jni_class_name!(org.signal.libsignal.net.ChatService::ResponseAndDebugInfo);
+            get_preloaded_class(env, RESPONSE_CLASS)
+                .transpose()
+                .unwrap_or_else(|| env.find_class(RESPONSE_CLASS))?
+        };
+
+        Ok(new_object(
+            env,
+            class,
+            jni_args!((
+                response => org.signal.libsignal.net.ChatService::Response,
+                debug_info => org.signal.libsignal.net.ChatService::DebugInfo
+            ) -> void),
+        )?)
+    }
+}
+
+/// Converts each element of `it` to a Java object, storing the result in an array.
+///
+/// `element_type_signature` should use [`jni_class_name`] if it's a plain class and
+/// [`jni_signature`] if it's an array (according to the official docs for the JNI [FindClass][]
+/// operation).
+///
+/// [FindClass]: https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/functions.html#FindClass
+fn make_object_array<'a, It: IntoIterator>(
     env: &mut JNIEnv<'a>,
+    element_type_signature: &str,
     it: It,
 ) -> Result<JObjectArray<'a>, BridgeLayerError>
 where
-    It::Item: AsRef<str>,
+    It::Item: ResultTypeInfo<'a>,
+    <It::Item as ResultTypeInfo<'a>>::ResultType: Into<JObject<'a>>,
     It::IntoIter: ExactSizeIterator,
 {
     let it = it.into_iter();
@@ -960,12 +1182,12 @@ where
     let array = env.new_object_array(
         len.try_into()
             .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{len}_usize to i32")))?,
-        jni_class_name!(java.lang.String),
+        element_type_signature,
         JavaObject::null(),
     )?;
 
-    for (index, s) in it.enumerate() {
-        let value = AutoLocal::new(env.new_string(s)?, env);
+    for (index, next) in it.enumerate() {
+        let value = AutoLocal::new(next.convert_into(env)?.into(), env);
         env.set_object_array_element(
             &array,
             index.try_into().expect("max size validated above"),
@@ -979,7 +1201,14 @@ where
 impl<'a> ResultTypeInfo<'a> for Box<[String]> {
     type ResultType = JObjectArray<'a>;
     fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
-        make_string_array(env, &*self)
+        make_object_array(env, jni_class_name!(java.lang.String), self.into_vec())
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for Box<[Vec<u8>]> {
+    type ResultType = JObjectArray<'a>;
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        make_object_array(env, jni_signature!([byte]), self.into_vec())
     }
 }
 
@@ -992,8 +1221,11 @@ impl<'a> ResultTypeInfo<'a> for MessageBackupValidationOutcome {
             found_unknown_fields,
         } = self;
 
-        let unknown_fields =
-            make_string_array(env, found_unknown_fields.into_iter().map(|f| f.to_string()))?;
+        let unknown_fields = make_object_array(
+            env,
+            jni_class_name!(java.lang.String),
+            found_unknown_fields.into_iter().map(|f| f.to_string()),
+        )?;
         let error_message = error_message.convert_into(env)?;
 
         let new_object = new_object(
@@ -1057,6 +1289,9 @@ macro_rules! jni_arg_type {
         // Note: not a jbyte. It's better to preserve the signedness here.
         jni::jint
     };
+    (u16) => {
+        jni::jint
+    };
     (u32) => {
         jni::jint
     };
@@ -1087,6 +1322,9 @@ macro_rules! jni_arg_type {
     (&[u8; $len:expr]) => {
         jni::JByteArray<'local>
     };
+    (Box<[u8]>) => {
+        jni::JByteArray<'local>
+    };
     (ServiceId) => {
         jni::JByteArray<'local>
     };
@@ -1098,6 +1336,9 @@ macro_rules! jni_arg_type {
     };
     (ServiceIdSequence<'_>) => {
         jni::JByteArray<'local>
+    };
+    (Vec<&[u8]>) => {
+        jni::JavaByteBufferArray<'local>
     };
     (Timestamp) => {
         jni::jlong
@@ -1129,6 +1370,9 @@ macro_rules! jni_arg_type {
     (Serialized<$typ:ident>) => {
         jni::JByteArray<'local>
     };
+    (AsType<$typ:ident, $bridged:ident>) => {
+        jni_arg_type!($bridged)
+    };
 
     (Ignored<$typ:ty>) => (jni::JObject<'local>);
 }
@@ -1149,19 +1393,19 @@ macro_rules! jni_result_type {
     // Therefore, if you need to return a more complicated Result or Option
     // type, you'll have to add another rule for its form.
     (Result<$typ:tt $(, $_:ty)?>) => {
-        jni_result_type!($typ)
+        jni::Throwing<jni_result_type!($typ)>
     };
     (Result<&$typ:tt $(, $_:ty)?>) => {
-        jni_result_type!(&$typ)
+        jni::Throwing<jni_result_type!(&$typ)>
     };
     (Result<Option<&$typ:tt> $(, $_:ty)?>) => {
-        jni_result_type!(&$typ)
+        jni::Throwing<jni_result_type!(&$typ)>
     };
     (Result<Option<$typ:tt<$($args:tt),+> > $(, $_:ty)?>) => {
-        jni_result_type!($typ<$($args),+>)
+        jni::Throwing<jni_result_type!($typ<$($args),+>)>
     };
     (Result<$typ:tt<$($args:tt),+> $(, $_:ty)?>) => {
-        jni_result_type!($typ<$($args),+>)
+        jni::Throwing<jni_result_type!($typ<$($args),+>)>
     };
     (Option<$typ:tt>) => {
         jni_result_type!($typ)
@@ -1209,14 +1453,17 @@ macro_rules! jni_result_type {
     (&[u8]) => {
         jni::JByteArray<'local>
     };
-    (Box<[String]>) => {
-        jni::JObjectArray<'local>
+    (Vec<u8>) => {
+        jni::JByteArray<'local>
     };
     (&[String]) => {
         jni::JObjectArray<'local>
     };
-    (Vec<u8>) => {
-        jni::JByteArray<'local>
+    (Box<[String]>) => {
+        jni::JObjectArray<'local>
+    };
+    (Box<[Vec<u8>]>) => {
+        jni::JavaArrayOfByteArray<'local>
     };
     (Cds2Metrics) => {
         jni::JavaMap<'local>
@@ -1237,6 +1484,15 @@ macro_rules! jni_result_type {
         jni::JObject<'local>
     };
     (LookupResponse) => {
+        jni::JObject<'local>
+    };
+    (ChatResponse) => {
+        jni::JObject<'local>
+    };
+    (ChatServiceDebugInfo) => {
+        jni::JObject<'local>
+    };
+    (ResponseAndDebugInfo) => {
         jni::JObject<'local>
     };
     (CiphertextMessage) => {

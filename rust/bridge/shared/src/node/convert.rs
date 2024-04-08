@@ -4,17 +4,20 @@
 //
 
 use neon::prelude::*;
+use neon::types::JsBigInt;
 use paste::paste;
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 
+use std::fmt::Display;
 use std::hash::Hasher;
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut, RangeInclusive};
 use std::slice;
 
 use crate::io::{InputStream, SyncInputStream};
-use crate::support::{Array, FixedLengthBincodeSerializable, Serialized};
+use crate::net::ResponseAndDebugInfo;
+use crate::support::{extend_lifetime, Array, AsType, FixedLengthBincodeSerializable, Serialized};
 
 use super::*;
 
@@ -278,13 +281,11 @@ impl SimpleArgTypeInfo for crate::zkgroup::Timestamp {
 }
 
 impl SimpleArgTypeInfo for u64 {
-    type ArgType = JsBuffer; // FIXME: eventually this should be a bigint
+    type ArgType = JsBigInt;
     fn convert_from(cx: &mut FunctionContext, foreign: Handle<Self::ArgType>) -> NeonResult<Self> {
         foreign
-            .as_slice(cx)
-            .try_into()
-            .map(u64::from_be_bytes)
-            .or_else(|_| cx.throw_type_error("expected a buffer of 8 big-endian bytes"))
+            .to_u64(cx)
+            .or_else(|_| cx.throw_range_error("value out of range for Rust u64"))
     }
 }
 
@@ -349,6 +350,14 @@ impl SimpleArgTypeInfo for bool {
     type ArgType = JsBoolean;
     fn convert_from(cx: &mut FunctionContext, foreign: Handle<Self::ArgType>) -> NeonResult<Self> {
         Ok(foreign.value(cx))
+    }
+}
+
+impl SimpleArgTypeInfo for Box<[u8]> {
+    type ArgType = JsBuffer;
+
+    fn convert_from(cx: &mut FunctionContext, foreign: Handle<Self::ArgType>) -> NeonResult<Self> {
+        Ok(foreign.as_slice(cx).to_vec().into())
     }
 }
 
@@ -558,7 +567,7 @@ impl<'a> AsyncArgTypeInfo<'a> for &'a [u8] {
 
 /// See [`AssumedImmutableBuffer`].
 impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context>
-    for crate::protocol::ServiceIdSequence<'storage>
+    for crate::support::ServiceIdSequence<'storage>
 {
     type ArgType = JsBuffer;
     type StoredType = AssumedImmutableBuffer<'context>;
@@ -574,7 +583,7 @@ impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context>
 }
 
 /// See [`PersistentAssumedImmutableBuffer`].
-impl<'a> AsyncArgTypeInfo<'a> for crate::protocol::ServiceIdSequence<'a> {
+impl<'a> AsyncArgTypeInfo<'a> for crate::support::ServiceIdSequence<'a> {
     type ArgType = JsBuffer;
     type StoredType = PersistentAssumedImmutableBuffer;
     fn save_async_arg(
@@ -585,6 +594,30 @@ impl<'a> AsyncArgTypeInfo<'a> for crate::protocol::ServiceIdSequence<'a> {
     }
     fn load_async_arg(stored: &'a mut Self::StoredType) -> Self {
         Self::parse(&*stored)
+    }
+}
+
+impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context> for Vec<&'storage [u8]> {
+    type ArgType = JsArray;
+    type StoredType = Vec<AssumedImmutableBuffer<'context>>;
+
+    fn borrow(
+        cx: &mut FunctionContext<'context>,
+        foreign: Handle<'context, Self::ArgType>,
+    ) -> NeonResult<Self::StoredType> {
+        let count = foreign.len(cx);
+        (0..count)
+            .map(|i| {
+                let next = foreign.get(cx, i)?;
+                Ok(AssumedImmutableBuffer::new(cx, next))
+            })
+            .collect()
+    }
+
+    fn load_from(stored: &'storage mut Self::StoredType) -> Self {
+        // This effectively makes a copy of the storage with the hashes dropped. That's not very
+        // efficient, but it's not likely to be a performance bottleneck either.
+        stored.iter().map(|buffer| buffer as &[u8]).collect()
     }
 }
 
@@ -678,12 +711,10 @@ impl<'a> ResultTypeInfo<'a> for crate::zkgroup::Timestamp {
 }
 
 impl<'a> ResultTypeInfo<'a> for u64 {
-    type ResultType = JsBuffer; // FIXME: eventually this should be a bigint
+    type ResultType = JsBigInt;
 
     fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
-        let mut result = cx.buffer(8)?;
-        result.as_mut_slice(cx).copy_from_slice(&self.to_be_bytes());
-        Ok(result)
+        Ok(JsBigInt::from_u64(cx, self))
     }
 }
 
@@ -767,22 +798,26 @@ impl<'a> ResultTypeInfo<'a> for Vec<u8> {
 impl<'a> ResultTypeInfo<'a> for Box<[String]> {
     type ResultType = JsArray;
     fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
-        make_string_array(cx, &*self)
+        make_array(cx, self.into_vec())
     }
 }
 
-fn make_string_array<'a, It: IntoIterator>(
-    cx: &mut impl Context<'a>,
-    it: It,
-) -> JsResult<'a, JsArray>
+impl<'a> ResultTypeInfo<'a> for Box<[Vec<u8>]> {
+    type ResultType = JsArray;
+    fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
+        make_array(cx, self.into_vec())
+    }
+}
+
+fn make_array<'a, It: IntoIterator>(cx: &mut impl Context<'a>, it: It) -> JsResult<'a, JsArray>
 where
     It::IntoIter: ExactSizeIterator,
-    It::Item: AsRef<str>,
+    It::Item: ResultTypeInfo<'a>,
 {
     let it = it.into_iter();
-    let array = JsArray::new(cx, it.len().try_into().expect("< u32::MAX"));
-    for (unknown, i) in it.zip(0..) {
-        let message = JsString::new(cx, unknown.as_ref());
+    let array = JsArray::new(cx, it.len());
+    for (next, i) in it.zip(0..) {
+        let message = next.convert_into(cx)?;
         array.set(cx, i, message)?;
     }
     Ok(array)
@@ -845,7 +880,7 @@ impl<'a> ResultTypeInfo<'a> for crate::message_backup::MessageBackupValidationOu
         } = self;
         let error_message = error_message.convert_into(cx)?;
         let unknown_field_messages =
-            make_string_array(cx, found_unknown_fields.into_iter().map(|s| s.to_string()))?;
+            make_array(cx, found_unknown_fields.into_iter().map(|s| s.to_string()))?;
 
         let obj = JsObject::new(cx);
         obj.set(cx, "errorMessage", error_message)?;
@@ -870,6 +905,93 @@ impl<'a, V: Value> OrUndefined<'a> for Option<Handle<'a, V>> {
     fn or_undefined(self, cx: &mut impl Context<'a>) -> Handle<'a, JsValue> {
         self.map(|v| v.as_value(cx))
             .unwrap_or_else(|| cx.undefined().as_value(cx))
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::Response {
+    type ResultType = JsObject;
+    fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
+        let Self {
+            status,
+            message,
+            body,
+            headers,
+        } = self;
+        let obj = JsObject::new(cx);
+
+        let headers_arr = JsArray::new(cx, headers.len());
+        for ((name, value), i) in headers.iter().zip(0..) {
+            let name = cx.string(name.as_str());
+            let value = cx.string(value.to_str().expect("valid header value"));
+            let entry = JsArray::new(cx, 2);
+            entry.set(cx, 0, name)?;
+            entry.set(cx, 1, value)?;
+            headers_arr.set(cx, i, entry)?;
+        }
+
+        let status = cx.number(status.as_u16());
+        let message = match message {
+            Some(m) => cx.string(m).as_value(cx),
+            None => cx.undefined().as_value(cx),
+        };
+        let body = match body {
+            Some(b) => b.convert_into(cx)?.as_value(cx),
+            None => cx.undefined().as_value(cx),
+        };
+
+        obj.set(cx, "status", status)?;
+        obj.set(cx, "message", message)?;
+        obj.set(cx, "body", body)?;
+        obj.set(cx, "headers", headers_arr)?;
+
+        Ok(obj)
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::DebugInfo {
+    type ResultType = JsObject;
+    fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
+        let Self {
+            connection_reused,
+            reconnect_count,
+            ip_type,
+            duration,
+            connection_info,
+        } = self;
+        let obj = JsObject::new(cx);
+
+        let connection_reused = cx.boolean(connection_reused);
+        let reconnect_count = cx.number(reconnect_count);
+        let ip_type = cx.number(ip_type as u8);
+        let duration = cx.number(duration.as_millis().try_into().unwrap_or(u32::MAX));
+        let connection_info = cx.string(connection_info);
+
+        obj.set(cx, "connectionReused", connection_reused)?;
+        obj.set(cx, "reconnectCount", reconnect_count)?;
+        obj.set(cx, "ipType", ip_type)?;
+        obj.set(cx, "durationMillis", duration)?;
+        obj.set(cx, "connectionInfo", connection_info)?;
+
+        Ok(obj)
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for ResponseAndDebugInfo {
+    type ResultType = JsObject;
+    fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
+        let Self {
+            response,
+            debug_info,
+        } = self;
+        let obj = JsObject::new(cx);
+
+        let response = response.convert_into(cx)?;
+        let debug_info = debug_info.convert_into(cx)?;
+
+        obj.set(cx, "response", response)?;
+        obj.set(cx, "debugInfo", debug_info)?;
+
+        Ok(obj)
     }
 }
 
@@ -901,8 +1023,8 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::cdsi::LookupResponse {
         } = self;
 
         let map_constructor: Handle<'_, JsFunction> =
-            cx.global().get(cx, "Map").expect("Map constructor exists");
-        let num_elements = records.len().try_into().expect("< u32::MAX");
+            cx.global("Map").expect("Map constructor exists");
+        let num_elements = records.len();
 
         // Construct a JS Map by calling its constructor with an array of [K, V] arrays.
         let entries = JsArray::new(cx, num_elements);
@@ -963,6 +1085,23 @@ full_range_integer!(u16);
 full_range_integer!(u32);
 full_range_integer!(i32);
 
+impl<T, P> SimpleArgTypeInfo for AsType<T, P>
+where
+    T: 'static,
+    P: SimpleArgTypeInfo + TryInto<T> + 'static,
+    P::Error: Display,
+{
+    type ArgType = P::ArgType;
+
+    fn convert_from(cx: &mut FunctionContext, foreign: Handle<Self::ArgType>) -> NeonResult<Self> {
+        let p = P::convert_from(cx, foreign)?;
+        match p.try_into() {
+            Ok(t) => Ok(AsType::from(t)),
+            Err(e) => cx.throw_type_error(format!("invalid {}: {e}", std::any::type_name::<T>())),
+        }
+    }
+}
+
 impl<T> SimpleArgTypeInfo for Serialized<T>
 where
     T: FixedLengthBincodeSerializable
@@ -998,14 +1137,6 @@ where
         let result = zkgroup::serialize(self.deref());
         result.convert_into(cx)
     }
-}
-
-/// Extremely unsafe function to extend the lifetime of a reference.
-///
-/// Only here so that we're not directly calling [`std::mem::transmute`], which is even more unsafe.
-/// All call sites need to explain why extending the lifetime is safe.
-pub(crate) unsafe fn extend_lifetime<'a, 'b: 'a, T: ?Sized>(some_ref: &'a T) -> &'b T {
-    std::mem::transmute::<&'a T, &'b T>(some_ref)
 }
 
 /// The name of the property on JavaScript objects that wrap a boxed Rust value.

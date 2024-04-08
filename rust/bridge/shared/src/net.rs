@@ -5,27 +5,52 @@
 
 use std::convert::TryInto as _;
 use std::future::Future;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::panic::RefUnwindSafe;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::prelude::{Engine, BASE64_STANDARD};
+use futures_util::future::TryFutureExt as _;
+use http::uri::{InvalidUri, PathAndQuery};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use libsignal_bridge_macros::{bridge_fn, bridge_io};
 use libsignal_net::auth::Auth;
-use libsignal_net::cdsi::{
-    self, AciAndAccessKey, CdsiConnection, ClientResponseCollector, LookupResponse, Token, E164,
+use libsignal_net::chat::{
+    chat_service, ChatServiceError, ChatServiceWithDebugInfo, DebugInfo as ChatServiceDebugInfo,
+    Request, Response as ChatResponse,
 };
-use libsignal_net::enclave::{Cdsi, EndpointConnection};
+use libsignal_net::enclave::{
+    Cdsi, EnclaveEndpoint, EnclaveEndpointConnection, EnclaveKind, Nitro, PpssSetup, Sgx, Tpm2Snp,
+};
 use libsignal_net::env::{Env, Svr3Env};
 use libsignal_net::infra::connection_manager::MultiRouteConnectionManager;
-use libsignal_net::infra::errors::NetError;
-use libsignal_net::infra::TcpSslTransportConnector;
-use libsignal_net::utils::timeout;
-use libsignal_protocol::{Aci, SignalProtocolError};
+use libsignal_net::infra::dns::DnsResolver;
+use libsignal_net::infra::tcp_ssl::{
+    DirectConnector as TcpSslDirectConnector, TcpSslConnector, TcpSslConnectorStream,
+};
+use libsignal_net::infra::{make_ws_config, EndpointConnection};
+use libsignal_net::svr::{self, SvrConnection};
+use libsignal_net::svr3::{self, OpaqueMaskedShareSet, PpssOps as _};
+use libsignal_net::{chat, env};
+use rand::rngs::OsRng;
+use tokio::sync::mpsc;
 
 use crate::support::*;
 use crate::*;
 
+pub(crate) mod cdsi;
+
 pub struct TokioAsyncContext(tokio::runtime::Runtime);
 
-#[bridge_fn(ffi = false)]
+/// Assert [`TokioAsyncContext`] is unwind-safe.
+///
+/// [`tokio::runtime::Runtime`] handles panics in spawned tasks internally, and
+/// spawning a task on it shouldn't cause logic errors if that panics.
+impl std::panic::RefUnwindSafe for TokioAsyncContext {}
+
+#[bridge_fn]
 fn TokioAsyncContext_new() -> TokioAsyncContext {
     TokioAsyncContext(tokio::runtime::Runtime::new().expect("failed to create runtime"))
 }
@@ -51,13 +76,14 @@ bridge_handle!(TokioAsyncContext, clone = false);
 
 #[derive(num_enum::TryFromPrimitive)]
 #[repr(u8)]
+#[derive(Clone, Copy)]
 pub enum Environment {
     Staging = 0,
     Prod = 1,
 }
 
 impl Environment {
-    fn env(&self) -> Env<'static, Svr3Env> {
+    fn env<'a>(self) -> Env<'a, Svr3Env<'a>> {
         match self {
             Self::Staging => libsignal_net::env::STAGING,
             Self::Prod => libsignal_net::env::PROD,
@@ -66,144 +92,340 @@ impl Environment {
 }
 
 pub struct ConnectionManager {
-    cdsi: EndpointConnection<Cdsi, MultiRouteConnectionManager, TcpSslTransportConnector>,
+    chat: EndpointConnection<MultiRouteConnectionManager>,
+    cdsi: EnclaveEndpointConnection<Cdsi, MultiRouteConnectionManager>,
+    svr3: (
+        EnclaveEndpointConnection<Sgx, MultiRouteConnectionManager>,
+        EnclaveEndpointConnection<Nitro, MultiRouteConnectionManager>,
+        EnclaveEndpointConnection<Tpm2Snp, MultiRouteConnectionManager>,
+    ),
+    transport_connector: std::sync::Mutex<TcpSslConnector>,
 }
+
+impl RefUnwindSafe for ConnectionManager {}
 
 impl ConnectionManager {
     const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
     fn new(environment: Environment) -> Self {
-        let cdsi_endpoint = environment.env().cdsi;
-        let connection_params = cdsi_endpoint
-            .domain_config
+        let dns_resolver =
+            DnsResolver::new_with_static_fallback(environment.env().static_fallback());
+        let transport_connector =
+            std::sync::Mutex::new(TcpSslDirectConnector::new(dns_resolver).into());
+        let chat_endpoint = PathAndQuery::from_static(env::constants::WEB_SOCKET_PATH);
+        let chat_connection_params = environment
+            .env()
+            .chat_domain_config
             .connection_params_with_fallback();
+        let chat_ws_config = make_ws_config(chat_endpoint, Self::DEFAULT_CONNECT_TIMEOUT);
         Self {
-            cdsi: EndpointConnection::new_multi(
-                cdsi_endpoint.mr_enclave,
-                connection_params,
+            chat: EndpointConnection::new_multi(
+                chat_connection_params,
                 Self::DEFAULT_CONNECT_TIMEOUT,
-                TcpSslTransportConnector,
+                chat_ws_config,
             ),
+            cdsi: Self::endpoint_connection(environment.env().cdsi),
+            svr3: (
+                Self::endpoint_connection(environment.env().svr3.sgx()),
+                Self::endpoint_connection(environment.env().svr3.nitro()),
+                Self::endpoint_connection(environment.env().svr3.tpm2snp()),
+            ),
+            transport_connector,
         }
+    }
+
+    fn endpoint_connection<E: EnclaveKind>(
+        endpoint: EnclaveEndpoint<'static, E>,
+    ) -> EnclaveEndpointConnection<E, MultiRouteConnectionManager> {
+        let params = endpoint.domain_config.connection_params_with_fallback();
+        EnclaveEndpointConnection::new_multi(
+            endpoint.mr_enclave,
+            params,
+            Self::DEFAULT_CONNECT_TIMEOUT,
+        )
     }
 }
 
 #[bridge_fn]
-pub fn ConnectionManager_new(environment: u8) -> ConnectionManager {
-    ConnectionManager::new(environment.try_into().expect("is valid environment value"))
+fn ConnectionManager_new(environment: AsType<Environment, u8>) -> ConnectionManager {
+    ConnectionManager::new(environment.into_inner())
+}
+
+#[bridge_fn]
+fn ConnectionManager_set_proxy(
+    connection_manager: &ConnectionManager,
+    host: String,
+    port: AsType<NonZeroU16, u16>,
+) {
+    let port = port.into_inner();
+    let proxy_addr = (host.as_str(), port);
+    let mut guard = connection_manager
+        .transport_connector
+        .lock()
+        .expect("not poisoned");
+    match &mut *guard {
+        TcpSslConnector::Direct(direct) => *guard = direct.with_proxy(proxy_addr).into(),
+        TcpSslConnector::Proxied(proxied) => proxied.set_proxy(proxy_addr),
+    };
+}
+
+#[bridge_fn]
+fn ConnectionManager_clear_proxy(connection_manager: &ConnectionManager) {
+    let mut guard = connection_manager
+        .transport_connector
+        .lock()
+        .expect("not poisoned");
+    match &*guard {
+        TcpSslConnector::Direct(_direct) => (),
+        TcpSslConnector::Proxied(proxied) => {
+            *guard = TcpSslDirectConnector::new(proxied.dns_resolver.clone()).into()
+        }
+    };
 }
 
 bridge_handle!(ConnectionManager, clone = false);
 
-#[derive(Default)]
-pub struct LookupRequest(std::sync::Mutex<cdsi::LookupRequest>);
-
 #[bridge_fn]
-fn LookupRequest_new() -> LookupRequest {
-    LookupRequest::default()
+fn CreateOTP(username: String, secret: &[u8]) -> String {
+    Auth::otp(&username, secret, std::time::SystemTime::now())
 }
 
 #[bridge_fn]
-fn LookupRequest_addE164(request: &LookupRequest, e164: E164) {
-    request.0.lock().expect("not poisoned").new_e164s.push(e164)
+fn CreateOTPFromBase64(username: String, secret: String) -> String {
+    let secret = BASE64_STANDARD.decode(secret).expect("valid base64");
+    Auth::otp(&username, &secret, std::time::SystemTime::now())
 }
 
-#[bridge_fn]
-fn LookupRequest_addPreviousE164(request: &LookupRequest, e164: E164) {
-    request
-        .0
-        .lock()
-        .expect("not poisoned")
-        .prev_e164s
-        .push(e164)
-}
-
-#[bridge_fn]
-fn LookupRequest_setToken(request: &LookupRequest, token: &[u8]) {
-    request.0.lock().expect("not poisoned").token = token.into();
-}
-
-#[bridge_fn]
-fn LookupRequest_addAciAndAccessKey(
-    request: &LookupRequest,
-    aci: Aci,
-    access_key: &[u8],
-) -> Result<(), SignalProtocolError> {
-    let access_key = access_key
+#[bridge_io(TokioAsyncContext)]
+async fn Svr3Backup(
+    connection_manager: &ConnectionManager,
+    secret: Box<[u8]>,
+    password: String,
+    max_tries: AsType<NonZeroU32, u32>,
+    username: String,         // hex-encoded uid
+    enclave_password: String, // timestamp:otp(...)
+) -> Result<Vec<u8>, svr3::Error> {
+    let secret = secret
+        .as_ref()
         .try_into()
-        .map_err(|_: std::array::TryFromSliceError| {
-            SignalProtocolError::InvalidArgument("access_key has wrong number of bytes".to_string())
-        })?;
-    request
-        .0
-        .lock()
-        .expect("not poisoned")
-        .acis_and_access_keys
-        .push(AciAndAccessKey { aci, access_key });
-    Ok(())
+        .expect("can only backup 32 bytes");
+    let mut rng = OsRng;
+    let share_set = svr3_connect(connection_manager, username, enclave_password)
+        .map_err(|err| err.into())
+        .and_then(|connections| {
+            Svr3Env::backup(
+                connections,
+                &password,
+                secret,
+                max_tries.into_inner(),
+                &mut rng,
+            )
+        })
+        .await?;
+    Ok(share_set.serialize().expect("can serialize the share set"))
 }
 
-#[bridge_fn]
-fn LookupRequest_setReturnAcisWithoutUaks(request: &LookupRequest, return_acis_without_uaks: bool) {
-    request
-        .0
-        .lock()
-        .expect("not poisoned")
-        .return_acis_without_uaks = return_acis_without_uaks;
+#[bridge_io(TokioAsyncContext)]
+async fn Svr3Restore(
+    connection_manager: &ConnectionManager,
+    password: String,
+    share_set: Box<[u8]>,
+    username: String,         // hex-encoded uid
+    enclave_password: String, // timestamp:otp(...)
+) -> Result<Vec<u8>, svr3::Error> {
+    let mut rng = OsRng;
+    let share_set = OpaqueMaskedShareSet::deserialize(&share_set)?;
+    let restored_secret = svr3_connect(connection_manager, username, enclave_password)
+        .map_err(|err| err.into())
+        .and_then(|connections| Svr3Env::restore(connections, &password, share_set, &mut rng))
+        .await?;
+    Ok(restored_secret.to_vec())
 }
 
-bridge_handle!(LookupRequest, clone = false);
-
-pub struct CdsiLookup {
-    token: Token,
-    remaining: std::sync::Mutex<Option<ClientResponseCollector>>,
-}
-bridge_handle!(CdsiLookup, clone = false);
-
-#[bridge_io(TokioAsyncContext, ffi = false)]
-async fn CdsiLookup_new(
+async fn svr3_connect<'a>(
     connection_manager: &ConnectionManager,
     username: String,
     password: String,
-    request: &LookupRequest,
-    timeout_millis: u32,
-) -> Result<CdsiLookup, cdsi::LookupError> {
-    let request = std::mem::take(&mut *request.0.lock().expect("not poisoned"));
+) -> Result<<Svr3Env<'a> as PpssSetup<TcpSslConnectorStream>>::Connections, svr::Error> {
     let auth = Auth { username, password };
+    let ConnectionManager {
+        chat: _chat,
+        cdsi: _cdsi,
+        svr3: (sgx, nitro, tpm2snp),
+        transport_connector,
+    } = connection_manager;
+    let transport_connector = transport_connector.lock().expect("not poisoned").clone();
+    let sgx = SvrConnection::connect(auth.clone(), sgx, transport_connector.clone()).await?;
+    let nitro = SvrConnection::connect(auth.clone(), nitro, transport_connector.clone()).await?;
+    let tpm2snp = SvrConnection::connect(auth, tpm2snp, transport_connector).await?;
+    Ok((sgx, nitro, tpm2snp))
+}
 
-    let connected = CdsiConnection::connect(&connection_manager.cdsi, auth).await?;
-    let (token, remaining_response) = timeout(
-        Duration::from_millis(timeout_millis.into()),
-        cdsi::LookupError::Net(NetError::Timeout),
-        connected.send_request(request),
-    )
-    .await?;
+pub struct Chat {
+    service: chat::Chat<
+        Arc<dyn ChatServiceWithDebugInfo + Send + Sync>,
+        Arc<dyn ChatServiceWithDebugInfo + Send + Sync>,
+    >,
+}
 
-    Ok(CdsiLookup {
-        token,
-        remaining: std::sync::Mutex::new(Some(remaining_response)),
+impl RefUnwindSafe for Chat {}
+
+pub struct HttpRequest {
+    pub method: http::Method,
+    pub path: PathAndQuery,
+    pub body: Option<Box<[u8]>>,
+    pub headers: std::sync::Mutex<HeaderMap>,
+}
+
+pub struct ResponseAndDebugInfo {
+    pub response: ChatResponse,
+    pub debug_info: ChatServiceDebugInfo,
+}
+
+bridge_handle!(Chat, clone = false);
+bridge_handle!(HttpRequest, clone = false);
+
+/// Newtype wrapper for implementing [`TryFrom`]`
+struct HttpMethod(http::Method);
+
+impl TryFrom<String> for HttpMethod {
+    type Error = <http::Method as FromStr>::Err;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        FromStr::from_str(&value).map(Self)
+    }
+}
+
+fn http_request_new_impl(
+    method: AsType<HttpMethod, String>,
+    path: String,
+    body_as_slice: Option<&[u8]>,
+) -> Result<HttpRequest, InvalidUri> {
+    let body = body_as_slice.map(|slice| slice.to_vec().into_boxed_slice());
+    let method = method.into_inner().0;
+    let path = path.try_into()?;
+    Ok(HttpRequest {
+        method,
+        path,
+        body,
+        headers: Default::default(),
     })
 }
 
-#[bridge_fn]
-fn CdsiLookup_token(lookup: &CdsiLookup) -> &[u8] {
-    &lookup.token.0
+#[bridge_fn(ffi = false)]
+fn HttpRequest_new(
+    method: AsType<HttpMethod, String>,
+    path: String,
+    body_as_slice: Option<&[u8]>,
+) -> Result<HttpRequest, InvalidUri> {
+    http_request_new_impl(method, path, body_as_slice)
 }
 
-#[bridge_io(TokioAsyncContext, ffi = false)]
-async fn CdsiLookup_complete(lookup: &CdsiLookup) -> Result<LookupResponse, cdsi::LookupError> {
-    let CdsiLookup {
-        token: _,
-        remaining,
-    } = lookup;
+#[bridge_fn(jni = false, node = false)]
+fn HttpRequest_new_with_body(
+    method: AsType<HttpMethod, String>,
+    path: String,
+    body_as_slice: &[u8],
+) -> Result<HttpRequest, InvalidUri> {
+    http_request_new_impl(method, path, Some(body_as_slice))
+}
 
-    let remaining = remaining
-        .lock()
-        .expect("not poisoned")
-        .take()
-        .expect("not completed yet");
+#[bridge_fn(jni = false, node = false)]
+fn HttpRequest_new_without_body(
+    method: AsType<HttpMethod, String>,
+    path: String,
+) -> Result<HttpRequest, InvalidUri> {
+    http_request_new_impl(method, path, None)
+}
 
-    remaining.collect().await
+#[bridge_fn]
+fn HttpRequest_add_header(
+    request: &HttpRequest,
+    name: AsType<HeaderName, String>,
+    value: AsType<HeaderValue, String>,
+) {
+    let mut guard = request.headers.lock().expect("not poisoned");
+    let header_key = name.into_inner();
+    let header_value = value.into_inner();
+    (*guard).append(header_key, header_value);
+}
+
+#[bridge_fn]
+fn ChatService_new(
+    connection_manager: &ConnectionManager,
+    username: String,
+    password: String,
+) -> Chat {
+    let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+    Chat {
+        service: chat_service(
+            &connection_manager.chat,
+            connection_manager
+                .transport_connector
+                .lock()
+                .expect("not poisoned")
+                .clone(),
+            incoming_tx,
+            username,
+            password,
+        )
+        .into_dyn(),
+    }
+}
+
+#[bridge_io(TokioAsyncContext)]
+async fn ChatService_disconnect(chat: &Chat) {
+    chat.service.disconnect().await
+}
+
+#[bridge_io(TokioAsyncContext)]
+async fn ChatService_connect_unauth(chat: &Chat) -> Result<ChatServiceDebugInfo, ChatServiceError> {
+    chat.service.connect_unauthenticated().await
+}
+
+#[bridge_io(TokioAsyncContext)]
+async fn ChatService_connect_auth(chat: &Chat) -> Result<ChatServiceDebugInfo, ChatServiceError> {
+    chat.service.connect_authenticated().await
+}
+
+#[bridge_io(TokioAsyncContext)]
+async fn ChatService_unauth_send(
+    chat: &Chat,
+    http_request: &HttpRequest,
+    timeout_millis: u32,
+) -> Result<ChatResponse, ChatServiceError> {
+    let headers = http_request.headers.lock().expect("not poisoned").clone();
+    let request = Request {
+        method: http_request.method.clone(),
+        path: http_request.path.clone(),
+        headers,
+        body: http_request.body.clone(),
+    };
+    chat.service
+        .send_unauthenticated(request, Duration::from_millis(timeout_millis.into()))
+        .await
+}
+
+#[bridge_io(TokioAsyncContext)]
+async fn ChatService_unauth_send_and_debug(
+    chat: &Chat,
+    http_request: &HttpRequest,
+    timeout_millis: u32,
+) -> Result<ResponseAndDebugInfo, ChatServiceError> {
+    let headers = http_request.headers.lock().expect("not poisoned").clone();
+    let request = Request {
+        method: http_request.method.clone(),
+        path: http_request.path.clone(),
+        headers,
+        body: http_request.body.clone(),
+    };
+    let (result, debug_info) = chat
+        .service
+        .send_unauthenticated_and_debug(request, Duration::from_millis(timeout_millis.into()))
+        .await;
+
+    result.map(|response| ResponseAndDebugInfo {
+        response,
+        debug_info,
+    })
 }
 
 #[cfg(test)]
@@ -212,6 +434,8 @@ mod test {
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::{mpsc, oneshot};
+
+    use test_case::test_case;
 
     use super::*;
 
@@ -321,5 +545,11 @@ mod test {
             .into_inner()
             .expect("not poisoned");
         assert_eq!(result, Some(FUTURE_RESULT));
+    }
+
+    #[test_case(Environment::Staging; "staging")]
+    #[test_case(Environment::Prod; "prod")]
+    fn can_create_connection_manager(env: Environment) {
+        let _ = ConnectionManager::new(env);
     }
 }

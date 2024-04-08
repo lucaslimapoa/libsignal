@@ -3,9 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use thiserror::Error;
+
 use crate::enclave::{IntoConnections, PpssSetup};
-use crate::infra::errors::NetError;
-use crate::infra::ws::{run_attested_interaction, AttestedConnectionError};
+use crate::infra::errors::LogSafeDisplay;
+use crate::infra::ws::{
+    run_attested_interaction, AttestedConnectionError, WebSocketConnectError, WebSocketServiceError,
+};
+use crate::infra::AsyncDuplexStream;
 use async_trait::async_trait;
 use bincode::Options as _;
 use futures_util::future::try_join_all;
@@ -52,13 +57,16 @@ impl SerializableMaskedShareSet {
 
 #[derive(Debug)]
 pub struct SerializeError;
-#[derive(Debug, Eq, PartialEq, displaydoc::Display)]
+
+#[derive(Debug, Eq, PartialEq, displaydoc::Display, Error)]
 pub enum DeserializeError {
-    /// Unexpected version {0}
+    /// Unexpected OpaqueMaskedShareSet serialization format version {0}
     BadVersion(u8),
-    /// Unsupported serialization format
+    /// Unsupported OpaqueMaskedShareSet serialization format
     BadFormat,
 }
+
+impl LogSafeDisplay for DeserializeError {}
 
 impl OpaqueMaskedShareSet {
     fn new(inner: MaskedShareSet) -> Self {
@@ -105,34 +113,91 @@ impl OpaqueMaskedShareSet {
     }
 }
 
-#[derive(Debug, displaydoc::Display)]
+/// SVR3-specific error type
+///
+/// In its essence it is simply a union of three other error types:
+/// - libsignal_svr3::Error for the errors originating in the PPSS implementation. Most of them are
+/// unlikely due to the way higher level APIs invoke the lower-level primitives from
+/// libsignal_svr3.
+/// - DeserializeError for the errors deserializing the OpaqueMaskedShareSet that is stored as a
+/// simple blob by the clients and may be corrupted.
+/// - libsignal_net::svr::Error for network related errors.
+#[derive(Debug, Error, displaydoc::Display)]
+#[ignore_extra_doc_attributes]
 pub enum Error {
-    /// SVR3 error: {0}
-    Logic(libsignal_svr3::Error),
+    /// Connection error: {0}
+    Connect(WebSocketConnectError),
     /// Network error: {0}
-    Network(String),
+    Service(#[from] WebSocketServiceError),
+    /// Protocol error after establishing a connection: {0}
+    Protocol(String),
+    /// Enclave attestation failed: {0}
+    AttestationError(attest::enclave::Error),
+    /// SVR3 request failed with status {0}
+    RequestFailed(libsignal_svr3::ErrorStatus),
+    /// Failure to restore data
+    ///
+    /// This could be caused by an invalid password or share set.
+    RestoreFailed,
+    /// Restore request failed with MISSING status,
+    ///
+    /// This could mean either the data was never backed-up or we ran out of attempts to restore
+    /// it.
+    DataMissing,
+    /// Connect timed out
+    ConnectionTimedOut,
+}
+
+impl From<DeserializeError> for Error {
+    fn from(err: DeserializeError) -> Self {
+        Self::Protocol(format!("DeserializationError {err}"))
+    }
+}
+
+impl From<attest::enclave::Error> for Error {
+    fn from(err: attest::enclave::Error) -> Self {
+        Self::AttestationError(err)
+    }
 }
 
 impl From<libsignal_svr3::Error> for Error {
     fn from(err: libsignal_svr3::Error) -> Self {
-        Self::Logic(err)
+        use libsignal_svr3::{Error as LogicError, PPSSError};
+        match err {
+            LogicError::Ppss(PPSSError::InvalidCommitment) => Self::RestoreFailed,
+            LogicError::BadResponseStatus(libsignal_svr3::ErrorStatus::Missing) => {
+                Self::DataMissing
+            }
+            LogicError::Oprf(_)
+            | LogicError::Ppss(_)
+            | LogicError::BadData
+            | LogicError::BadResponse
+            | LogicError::BadResponseStatus(_) => Self::Protocol(err.to_string()),
+        }
+    }
+}
+
+impl From<super::svr::Error> for Error {
+    fn from(err: super::svr::Error) -> Self {
+        use super::svr::Error as SvrError;
+        match err {
+            SvrError::WebSocketConnect(inner) => Self::Connect(inner),
+            SvrError::WebSocket(inner) => Self::Service(inner),
+            SvrError::Protocol => Self::Protocol("General SVR protocol error".to_string()),
+            SvrError::AttestationError(inner) => Self::AttestationError(inner),
+            SvrError::ConnectionTimedOut => Self::ConnectionTimedOut,
+        }
     }
 }
 
 impl From<AttestedConnectionError> for Error {
     fn from(err: AttestedConnectionError) -> Self {
-        Self::Network(format!("{:?}", err))
-    }
-}
-
-impl From<NetError> for Error {
-    fn from(err: NetError) -> Self {
-        Self::Network(err.to_string())
+        Self::from(super::svr::Error::from(err))
     }
 }
 
 #[async_trait]
-pub trait PpssOps: PpssSetup {
+pub trait PpssOps<S>: PpssSetup<S> {
     async fn backup(
         connections: Self::Connections,
         password: &str,
@@ -150,7 +215,7 @@ pub trait PpssOps: PpssSetup {
 }
 
 #[async_trait]
-impl<Env: PpssSetup> PpssOps for Env {
+impl<S: AsyncDuplexStream + 'static, Env: PpssSetup<S>> PpssOps<S> for Env {
     async fn backup(
         connections: Self::Connections,
         password: &str,
@@ -169,7 +234,13 @@ impl<Env: PpssSetup> PpssOps for Env {
         let result = try_join_all(futures).await?;
         let responses = result
             .into_iter()
-            .map(|next_or_close| next_or_close.next_or(NetError::Failure))
+            .enumerate()
+            .map(|(i, next_or_close)| {
+                let remote_address = connections.as_ref()[i].remote_address();
+                next_or_close.next_or(Error::Protocol(format!(
+                    "no response from {remote_address}"
+                )))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let share_set = backup.finalize(rng, &responses)?;
         Ok(OpaqueMaskedShareSet::new(share_set))
@@ -191,7 +262,13 @@ impl<Env: PpssSetup> PpssOps for Env {
         let result = try_join_all(futures).await?;
         let responses = result
             .into_iter()
-            .map(|next_or_close| next_or_close.next_or(NetError::Failure))
+            .enumerate()
+            .map(|(i, next_or_close)| {
+                let remote_address = connections.as_ref()[i].remote_address();
+                next_or_close.next_or(Error::Protocol(format!(
+                    "no response from {remote_address}"
+                )))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(restore.finalize(&responses)?)
     }

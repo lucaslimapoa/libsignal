@@ -43,7 +43,23 @@ pub unsafe extern "C" fn signal_free_buffer(buf: *const c_uchar, buf_len: usize)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn signal_free_string_array(array: StringArray) {
+pub unsafe extern "C" fn signal_free_list_of_strings(buffer: OwnedBufferOf<CStringPtr>) {
+    let strings = buffer.into_box();
+    for &s in &*strings {
+        signal_free_string(s);
+    }
+    drop(strings);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_free_lookup_response_entry_list(
+    buffer: OwnedBufferOf<crate::FfiCdsiLookupResponseEntry>,
+) {
+    drop(buffer.into_box())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_free_bytestring_array(array: BytestringArray) {
     drop(array.into_boxed_parts())
 }
 
@@ -127,6 +143,27 @@ pub unsafe extern "C" fn signal_error_get_type(err: *const SignalFfiError) -> u3
         }
         None => 0,
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_error_get_retry_after_seconds(
+    err: *const SignalFfiError,
+    out: *mut u32,
+) -> *mut SignalFfiError {
+    let err = AssertUnwindSafe(err);
+    run_ffi_safe(|| {
+        let err = err.as_ref().ok_or(SignalFfiError::NullPointer)?;
+        match err {
+            SignalFfiError::RateLimited {
+                retry_after_seconds,
+            } => write_result_to(out, *retry_after_seconds),
+            err => Err(SignalFfiError::Signal(
+                SignalProtocolError::InvalidArgument(format!(
+                    "cannot get retry_after_seconds from error ({err})"
+                )),
+            )),
+        }
+    })
 }
 
 #[no_mangle]

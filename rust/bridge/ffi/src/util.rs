@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use attest::enclave::Error as SgxError;
+use attest::enclave::Error as EnclaveError;
 use attest::hsm_enclave::Error as HsmEnclaveError;
 use device_transfer::Error as DeviceTransferError;
 use libsignal_bridge::ffi::*;
+use libsignal_net::svr3::Error as Svr3Error;
 use libsignal_protocol::*;
 use signal_crypto::Error as SignalCryptoError;
 use signal_pin::Error as PinError;
@@ -77,6 +78,17 @@ pub enum SignalErrorCode {
     InvalidMediaInput = 131,
     #[allow(dead_code)]
     UnsupportedMediaInput = 132,
+
+    ConnectionTimedOut = 133,
+    NetworkProtocol = 134,
+    RateLimited = 135,
+    WebSocket = 136,
+    CdsiInvalidToken = 137,
+    ConnectionFailed = 138,
+    ChatServiceInactive = 139,
+
+    SvrDataMissing = 150,
+    SvrRestoreFailed = 151,
 }
 
 impl From<&SignalFfiError> for SignalErrorCode {
@@ -85,6 +97,7 @@ impl From<&SignalFfiError> for SignalErrorCode {
             SignalFfiError::NullPointer => SignalErrorCode::NullParameter,
 
             SignalFfiError::UnexpectedPanic(_)
+            | SignalFfiError::InternalError(_)
             | SignalFfiError::DeviceTransfer(DeviceTransferError::InternalError(_))
             | SignalFfiError::Signal(SignalProtocolError::FfiBindingError(_)) => {
                 SignalErrorCode::InternalError
@@ -127,7 +140,7 @@ impl From<&SignalFfiError> for SignalErrorCode {
                 SignalErrorCode::InvalidKey
             }
 
-            SignalFfiError::Sgx(SgxError::AttestationDataError { .. }) => {
+            SignalFfiError::Sgx(EnclaveError::AttestationDataError { .. }) => {
                 SignalErrorCode::InvalidAttestationData
             }
 
@@ -168,9 +181,9 @@ impl From<&SignalFfiError> for SignalErrorCode {
             | SignalFfiError::Signal(SignalProtocolError::InvalidSealedSenderMessage(_))
             | SignalFfiError::Signal(SignalProtocolError::BadKEMCiphertextLength(_, _))
             | SignalFfiError::SignalCrypto(SignalCryptoError::InvalidTag)
-            | SignalFfiError::Sgx(SgxError::AttestationError(_))
-            | SignalFfiError::Sgx(SgxError::NoiseError(_))
-            | SignalFfiError::Sgx(SgxError::NoiseHandshakeError(_))
+            | SignalFfiError::Sgx(EnclaveError::AttestationError(_))
+            | SignalFfiError::Sgx(EnclaveError::NoiseError(_))
+            | SignalFfiError::Sgx(EnclaveError::NoiseHandshakeError(_))
             | SignalFfiError::HsmEnclave(HsmEnclaveError::HSMHandshakeError(_))
             | SignalFfiError::HsmEnclave(HsmEnclaveError::HSMCommunicationError(_)) => {
                 SignalErrorCode::InvalidMessage
@@ -186,7 +199,7 @@ impl From<&SignalFfiError> for SignalErrorCode {
             }
 
             SignalFfiError::Signal(SignalProtocolError::InvalidState(_, _))
-            | SignalFfiError::Sgx(SgxError::InvalidBridgeStateError)
+            | SignalFfiError::Sgx(EnclaveError::InvalidBridgeStateError)
             | SignalFfiError::HsmEnclave(HsmEnclaveError::InvalidBridgeStateError) => {
                 SignalErrorCode::InvalidState
             }
@@ -199,7 +212,8 @@ impl From<&SignalFfiError> for SignalErrorCode {
                 SignalErrorCode::InvalidSenderKeySession
             }
 
-            SignalFfiError::Signal(SignalProtocolError::InvalidArgument(_))
+            SignalFfiError::InvalidArgument(_)
+            | SignalFfiError::Signal(SignalProtocolError::InvalidArgument(_))
             | SignalFfiError::HsmEnclave(HsmEnclaveError::InvalidCodeHashError)
             | SignalFfiError::SignalCrypto(_) => SignalErrorCode::InvalidArgument,
 
@@ -309,6 +323,18 @@ impl From<&SignalFfiError> for SignalErrorCode {
                     }
                 }
             }
+            SignalFfiError::WebSocket(_) => SignalErrorCode::WebSocket,
+            SignalFfiError::ConnectionTimedOut => SignalErrorCode::ConnectionTimedOut,
+            SignalFfiError::ConnectionFailed => SignalErrorCode::ConnectionFailed,
+            SignalFfiError::ChatServiceInactive => SignalErrorCode::ChatServiceInactive,
+            SignalFfiError::NetworkProtocol(_) => SignalErrorCode::NetworkProtocol,
+            SignalFfiError::CdsiInvalidToken => SignalErrorCode::CdsiInvalidToken,
+            SignalFfiError::RateLimited {
+                retry_after_seconds: _,
+            } => SignalErrorCode::RateLimited,
+            SignalFfiError::Svr(Svr3Error::DataMissing) => SignalErrorCode::SvrDataMissing,
+            SignalFfiError::Svr(Svr3Error::RestoreFailed) => SignalErrorCode::SvrRestoreFailed,
+            SignalFfiError::Svr(_) => SignalErrorCode::UnknownError,
         }
     }
 }

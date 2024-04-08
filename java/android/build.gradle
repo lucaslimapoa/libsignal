@@ -1,5 +1,5 @@
 plugins {
-    id 'com.android.library' version '7.0.0'
+    id 'com.android.library' version '8.3.0'
     id 'maven-publish'
     id 'signing'
 }
@@ -13,21 +13,22 @@ repositories {
 }
 
 android {
-    compileSdkVersion 30
-    buildToolsVersion '30.0.2'
+    namespace 'org.signal.libsignal'
+
+    compileSdk 34
     ndkVersion '25.2.9519653'
 
     defaultConfig {
         minSdkVersion 21
-        targetSdkVersion 30
+        targetSdkVersion 33
         multiDexEnabled true
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
         coreLibraryDesugaringEnabled true
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     sourceSets {
@@ -48,6 +49,10 @@ android {
             pickFirst 'lib/*/libsignal_jni.so'
         }
     }
+
+    publishing {
+        singleVariant('release')
+    }
 }
 
 dependencies {
@@ -59,7 +64,7 @@ dependencies {
 
 tasks.register('libsWithDebugSymbols', Zip) {
     from 'src/main/jniLibs'
-    classifier 'debug-symbols'
+    archiveClassifier = 'debug-symbols'
     dependsOn 'makeJniLibraries'
 }
 
@@ -69,22 +74,28 @@ preBuild {
     dependsOn 'makeTestJniLibraries'
 }
 
-task makeJniLibraries(type:Exec) {
-  group 'Rust'
-  description 'Build the JNI libraries for Android'
+String[] archsFromProperty(String prop) {
+    findProperty(prop)?.split(',')?.findAll { it != '' }?.collect { 'android-' + it }
+}
 
-  // Explicitly specify 'bash' for Windows compatibility.
-  commandLine 'bash', '../build_jni.sh', 'android'
-  environment 'ANDROID_NDK_HOME', android.ndkDirectory
+task makeJniLibraries(type:Exec) {
+    group 'Rust'
+    description 'Build the JNI libraries for Android'
+
+    def archs = archsFromProperty('androidArchs') ?: ['android']
+    // Explicitly specify 'bash' for Windows compatibility.
+    commandLine 'bash', '../build_jni.sh', *archs
+    environment 'ANDROID_NDK_HOME', android.ndkDirectory
 }
 
 task makeTestJniLibraries(type:Exec) {
-  group 'Rust'
-  description 'Build JNI libraries for Android for testing'
+    group 'Rust'
+    description 'Build JNI libraries for Android for testing'
 
-  // Explicitly specify 'bash' for Windows compatibility.
-  commandLine 'bash', '../build_jni.sh', 'android', '--testing'
-  environment 'ANDROID_NDK_HOME', android.ndkDirectory
+    def archs = archsFromProperty('androidTestingArchs') ?: archsFromProperty('androidArchs') ?: ['android']
+    // Explicitly specify 'bash' for Windows compatibility.
+    commandLine 'bash', '../build_jni.sh', '--testing', *archs
+    environment 'ANDROID_NDK_HOME', android.ndkDirectory
 }
 
 task collectAssets(type:Copy) {

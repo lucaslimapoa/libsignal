@@ -5,6 +5,7 @@
 
 package org.signal.libsignal.zkgroup.auth;
 
+import static org.signal.libsignal.internal.FilterExceptions.filterExceptions;
 import static org.signal.libsignal.zkgroup.internal.Constants.RANDOM_LENGTH;
 
 import java.security.SecureRandom;
@@ -24,23 +25,6 @@ public class ClientZkAuthOperations {
     this.serverPublicParams = serverPublicParams;
   }
 
-  public AuthCredential receiveAuthCredential(
-      Aci aci, int redemptionTime, AuthCredentialResponse authCredentialResponse)
-      throws VerificationFailedException {
-    byte[] newContents =
-        Native.ServerPublicParams_ReceiveAuthCredential(
-            serverPublicParams.getInternalContentsForJNI(),
-            aci.toServiceIdFixedWidthBinary(),
-            redemptionTime,
-            authCredentialResponse.getInternalContentsForJNI());
-
-    try {
-      return new AuthCredential(newContents);
-    } catch (InvalidInputException e) {
-      throw new AssertionError(e);
-    }
-  }
-
   /**
    * Produces the AuthCredentialWithPni from a server-generated AuthCredentialWithPniResponse.
    *
@@ -51,12 +35,15 @@ public class ClientZkAuthOperations {
       Aci aci, Pni pni, long redemptionTime, AuthCredentialWithPniResponse authCredentialResponse)
       throws VerificationFailedException {
     byte[] newContents =
-        Native.ServerPublicParams_ReceiveAuthCredentialWithPniAsServiceId(
-            serverPublicParams.getInternalContentsForJNI(),
-            aci.toServiceIdFixedWidthBinary(),
-            pni.toServiceIdFixedWidthBinary(),
-            redemptionTime,
-            authCredentialResponse.getInternalContentsForJNI());
+        filterExceptions(
+            VerificationFailedException.class,
+            () ->
+                Native.ServerPublicParams_ReceiveAuthCredentialWithPniAsServiceId(
+                    serverPublicParams.getInternalContentsForJNI(),
+                    aci.toServiceIdFixedWidthBinary(),
+                    pni.toServiceIdFixedWidthBinary(),
+                    redemptionTime,
+                    authCredentialResponse.getInternalContentsForJNI()));
 
     try {
       return new AuthCredentialWithPni(newContents);
@@ -78,41 +65,18 @@ public class ClientZkAuthOperations {
       Aci aci, Pni pni, long redemptionTime, AuthCredentialWithPniResponse authCredentialResponse)
       throws VerificationFailedException {
     byte[] newContents =
-        Native.ServerPublicParams_ReceiveAuthCredentialWithPniAsAci(
-            serverPublicParams.getInternalContentsForJNI(),
-            aci.toServiceIdFixedWidthBinary(),
-            pni.toServiceIdFixedWidthBinary(),
-            redemptionTime,
-            authCredentialResponse.getInternalContentsForJNI());
+        filterExceptions(
+            VerificationFailedException.class,
+            () ->
+                Native.ServerPublicParams_ReceiveAuthCredentialWithPniAsAci(
+                    serverPublicParams.getInternalContentsForJNI(),
+                    aci.toServiceIdFixedWidthBinary(),
+                    pni.toServiceIdFixedWidthBinary(),
+                    redemptionTime,
+                    authCredentialResponse.getInternalContentsForJNI()));
 
     try {
       return new AuthCredentialWithPni(newContents);
-    } catch (InvalidInputException e) {
-      throw new AssertionError(e);
-    }
-  }
-
-  public AuthCredentialPresentation createAuthCredentialPresentation(
-      GroupSecretParams groupSecretParams, AuthCredential authCredential) {
-    return createAuthCredentialPresentation(new SecureRandom(), groupSecretParams, authCredential);
-  }
-
-  public AuthCredentialPresentation createAuthCredentialPresentation(
-      SecureRandom secureRandom,
-      GroupSecretParams groupSecretParams,
-      AuthCredential authCredential) {
-    byte[] random = new byte[RANDOM_LENGTH];
-    secureRandom.nextBytes(random);
-
-    byte[] newContents =
-        Native.ServerPublicParams_CreateAuthCredentialPresentationDeterministic(
-            serverPublicParams.getInternalContentsForJNI(),
-            random,
-            groupSecretParams.getInternalContentsForJNI(),
-            authCredential.getInternalContentsForJNI());
-
-    try {
-      return new AuthCredentialPresentation(newContents);
     } catch (InvalidInputException e) {
       throw new AssertionError(e);
     }
