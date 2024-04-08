@@ -157,6 +157,16 @@ public class UnidentifiedSenderMessageContent: NativeHandleOwner {
         }
         return .init(rawValue: rawHint)
     }
+
+    public func serialized() throws -> [UInt8] {
+        return withNativeHandle { nativeHandle in
+            failOnError {
+                try invokeFnReturningArray {
+                    signal_unidentified_sender_message_content_serialize($0, nativeHandle)
+                }
+            }
+        }
+    }
 }
 
 public func sealedSenderEncrypt(
